@@ -1,0 +1,22 @@
+{
+  "name": "vibe-lingual",
+  "version": "0.1.0",
+  "description": "Localize your app's UI without corrupting its logic. Scans every user-facing string by kind (JSX text, placeholder, aria-label, title, alt, toast, locale-sensitive date) and emits a six-block readiness brief; audits the stack for the gotchas that bite i18n retrofits (firebase-admin in SSR, structural-vs-presentational Intl, the timeZone decision, RTL surfaces, dynamic-route guard globs); then runs a confidence-routed extract -> wire -> translate -> guard loop that mutates only with per-file backups and idempotent re-runs. Deep on next-intl + App Router (cookie-driven locale, catalog parity guard, jsx-no-literals ratchet, ESM jest patch), with a real adapter seam that reports an honest not-yet-implemented for the rest instead of mishandling them. Validated against Celestia3.",
+  "author": {
+    "name": "626Labs LLC",
+    "url": "https://github.com/estevanhernandez-stack-ed/Vibe-Lingual"
+  },
+  "homepage": "https://github.com/estevanhernandez-stack-ed/Vibe-Lingual#readme",
+  "repository": "https://github.com/estevanhernandez-stack-ed/Vibe-Lingual",
+  "license": "MIT",
+  "keywords": [
+    "vibe-lingual",
+    "vibe-coding",
+    "i18n",
+    "internationalization",
+    "localization",
+    "next-intl",
+    "claude-code-plugin",
+    "626labs"
+  ]
+}

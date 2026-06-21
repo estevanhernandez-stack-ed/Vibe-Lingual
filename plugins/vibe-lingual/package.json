@@ -1,0 +1,29 @@
+{
+  "name": "@626labs/vibe-lingual-engine",
+  "version": "0.1.0",
+  "description": "Deterministic Node engine for the vibe-lingual Claude Code plugin — detection, string scan, audit, six-block brief, parity emit/verify, and the next-intl codemod adapter.",
+  "type": "module",
+  "private": true,
+  "author": "626Labs LLC",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/estevanhernandez-stack-ed/Vibe-Lingual.git"
+  },
+  "homepage": "https://github.com/estevanhernandez-stack-ed/Vibe-Lingual#readme",
+  "bin": {
+    "vibe-lingual": "./engine/cli.mjs"
+  },
+  "scripts": {
+    "test": "jest --passWithNoTests"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.24.0",
+    "@babel/parser": "^7.24.0",
+    "jest": "^29.7.0",
+    "jscodeshift": "^0.15.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
