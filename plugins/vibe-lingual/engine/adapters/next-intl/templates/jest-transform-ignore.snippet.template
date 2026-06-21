@@ -19,5 +19,14 @@ module.exports = async () => {
         : p
     )
   }
+  // Exclude vibe-lingual's own working dir from test discovery. Its per-file
+  // backups under .vibe-lingual/localize/backup/<batchId>/ mirror the source tree
+  // — INCLUDING co-located *.test.tsx files. Without this, jest globs those
+  // pre-mutation backup copies as live suites and they fail (a bare, unwrapped
+  // copy of a now-i18n'd component's test throws `No intl context found`).
+  config.testPathIgnorePatterns = [
+    ...(config.testPathIgnorePatterns || ['/node_modules/']),
+    '<rootDir>/.vibe-lingual/',
+  ]
   return config
 }

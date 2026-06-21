@@ -321,3 +321,104 @@ describe('MINOR — rollback removes a catalog the batch created (no dangling ca
     expect(existsSync(catPath)).toBe(false);
   });
 });
+
+// ===========================================================================
+// SECOND DOGFOOD (full M10 loop on real Celestia3) — three more defects the
+// unit suite missed, each a real-app integration gap:
+//
+//   DEFECT 3 (P0, Windows-only, crash): relToRoot's prefix test was separator-
+//     sensitive. inventory.app.root is stored posix ("C:/…") while a join()-built
+//     catalog path is native ("C:\…"); the mixed-separator startsWith() was false,
+//     so relToRoot returned the ABSOLUTE path, and a downstream join(appRoot, that)
+//     doubled the root → ENOENT, crashing the entire auto-write path on the first
+//     app with a pre-existing catalog. Every Windows user hit this immediately.
+//
+//   DEFECT 4 (P0, test-breaking): the test wrapper used messages={{}}. next-intl
+//     4.x does NOT echo a missing key — t('foo') THROWS MISSING_MESSAGE, turning
+//     every wrapped test red. The wrap must seed the extracted namespace messages
+//     AND add a non-throwing fallback (onError + getMessageFallback → key).
+//
+//   DEFECT 5 (test-discovery pollution): the plugin's own backups under
+//     .vibe-lingual/localize/backup/<batch>/ mirror the source tree, INCLUDING
+//     *.test.tsx copies. Jest globs them as live suites and the bare, pre-wrap
+//     copies fail (No intl context). The wire jest patch must add .vibe-lingual/
+//     to testPathIgnorePatterns.
+// ===========================================================================
+
+// a high-confidence client component WITH a co-located test, for the wrapper tests.
+const WRAP_TEST = `import { render, screen } from '@testing-library/react';
+import Greeting from '../components/Greeting';
+
+test('renders welcome', () => {
+  render(<Greeting />);
+});
+
+test('renders again', () => {
+  render(<Greeting />);
+});
+`;
+
+describe('DEFECT 3 — relToRoot survives a posix appRoot + native catalog path (no doubled path)', () => {
+  let root;
+  beforeEach(() => {
+    root = tmpApp();
+    write(root, 'src/components/Greeting.tsx', HIGH_CONF_CLIENT);
+    // a PRE-EXISTING flat catalog forces the pre-merge backupFile(catRelToRoot)
+    // path — the exact call that crashed when relToRoot handed back an abs path.
+    mkdirSync(join(root, 'messages'), { recursive: true });
+    writeFileSync(join(root, 'messages/en.json'), JSON.stringify({ common: { ok: 'OK' } }, null, 2), 'utf8');
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  test('extract does NOT crash when app.root is posix-style and the catalog exists', () => {
+    const inv = scan(root, detect(root));
+    // force the posix-slash form the real scan stores (and that broke startsWith).
+    inv.app.root = root.split('\\').join('/');
+    // the bug threw ENOENT here; the fix makes it complete cleanly.
+    const report = extract(inv, { appRoot: inv.app.root });
+    const r = report.results.find((x) => x.file === 'src/components/Greeting.tsx');
+    expect(r.status).toBe('written');
+    // the pre-existing catalog was backed up under a SANE (non-doubled) rel path.
+    const manifest = JSON.parse(
+      readFileSync(join(root, '.vibe-lingual/localize/backup', report.batchId, 'manifest.json'), 'utf8'),
+    );
+    expect(manifest.files.map((f) => f.source)).toContain('messages/en.json');
+    // the flat catalog grew the namespace, siblings intact.
+    const flat = JSON.parse(readFileSync(join(root, 'messages/en.json'), 'utf8'));
+    expect(flat.common).toEqual({ ok: 'OK' });
+    expect(flat.Greeting).toBeDefined();
+  });
+});
+
+describe('DEFECT 4 — the test wrapper seeds real messages + a non-throwing fallback', () => {
+  let root;
+  beforeEach(() => {
+    root = tmpApp();
+    write(root, 'src/components/Greeting.tsx', HIGH_CONF_CLIENT);
+    write(root, 'src/__tests__/Greeting.test.tsx', WRAP_TEST);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  test('the wrapped provider carries the extracted namespace messages, not messages={{}}', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root });
+    const testNow = readFileSync(join(root, 'src/__tests__/Greeting.test.tsx'), 'utf8');
+    // real messages seeded (so t('welcomeBack') resolves, not MISSING_MESSAGE).
+    expect(testNow).toContain('Greeting');
+    expect(testNow).toContain('Welcome back');
+    expect(testNow).not.toContain('messages={{}}');
+    // the empty-object literal regex must NOT match the messages attr anymore.
+    expect(/messages=\{\{\s*\}\}/.test(testNow)).toBe(false);
+  });
+
+  test('a non-throwing getMessageFallback + onError is present on every wrap', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root });
+    const testNow = readFileSync(join(root, 'src/__tests__/Greeting.test.tsx'), 'utf8');
+    // both render calls wrapped, each with the fallback (so an out-of-namespace key
+    // degrades to the key string instead of throwing).
+    const fallbacks = (testNow.match(/getMessageFallback=/g) || []).length;
+    expect(fallbacks).toBe(2);
+    expect((testNow.match(/onError=/g) || []).length).toBe(2);
+  });
+});

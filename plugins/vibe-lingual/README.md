@@ -14,6 +14,7 @@ Part of the [Vibe plugin family](https://github.com/estevanhernandez-stack-ed/vi
 | `/vibe-lingual:scan` | Inventory strings by kind + emit a six-block readiness brief | no |
 | `/vibe-lingual:audit` | Stack gotchas, per-file readiness, phased plan | no |
 | `/vibe-lingual:localize` | Extract -> wire -> translate -> guard | yes (confidence-routed) |
+| `/vibe-lingual:vitals` | Structural self-test of the plugin install | no |
 
 ## How it draws the line
 
@@ -27,7 +28,7 @@ Cookie-driven locale (no `/[locale]/` URL routing for preference-based apps), ca
 
 ## Status
 
-v0.1.0 — scaffold. The scan -> audit -> localize loop and the next-intl adapter land across the build milestones. Validated against Celestia3.
+v0.1.0. The full scan -> audit -> localize loop and the next-intl adapter (wire + transform + guard + parity) are built and dogfooded end-to-end on Celestia3: scan reproduces the six-block brief with accurate counts and leaves the already-localized surfaces untouched, audit flags the stack gotchas (structural-Intl, the timeZone decision, RTL, the dynamic-route glob), and localize extracts a real surface with per-file backup, idempotent re-runs, and a clean rollback — the app's own test suite staying green through the loop. Run `/vibe-lingual:vitals` for a structural self-test of the install.
 
 ## Install
 

@@ -209,21 +209,57 @@ function findCollateralTests(appRoot, relPath) {
   return found;
 }
 
-// Build the <NextIntlClientProvider locale="en" messages={{}} timeZone="UTC">
-// wrapper JSX element around an existing JSX argument. `messages` is left as an
-// empty object literal: next-intl tolerates missing keys at render with the key
-// echoed back, which keeps existing assertions on non-extracted text intact, and
-// the SKILL fills real messages when it knows the namespace.
-function buildProviderWrap(j, jsxArg) {
+// Build the <NextIntlClientProvider …> wrapper JSX element around an existing JSX
+// argument.
+//
+// MESSAGES + NON-THROWING FALLBACK (DEFECT — the Celestia3 dogfood gap). next-intl
+// 4.x does NOT echo a missing key back: an unresolved `t('foo')` THROWS
+// `MISSING_MESSAGE` and turns the wrapped test red — the exact failure the wrap was
+// meant to PREVENT. Two layers fix it:
+//   1. Seed `messages` with the namespace block this run just extracted (so the
+//      component's `t('shareMyDay')` resolves to the real source string and any
+//      existing getByText assertion on that text still passes).
+//   2. Add `onError={() => {}}` + `getMessageFallback={({ key }) => key}` so ANY
+//      key outside the seeded set (a sibling namespace, a key from a later phase)
+//      degrades to the key string instead of throwing. Belt-and-suspenders: the
+//      seeded messages cover the happy path, the fallback guarantees no throw.
+// `namespace`/`keys` may be absent (a generic wrap with no known namespace) — then
+// `messages` is left empty and only the fallback protects the render.
+function buildProviderWrap(j, jsxArg, namespace, keys) {
+  const messagesObj =
+    namespace && keys && Object.keys(keys).length > 0
+      ? j.objectExpression([
+          j.property(
+            'init',
+            j.stringLiteral(namespace),
+            j.objectExpression(
+              Object.entries(keys).map(([k, v]) =>
+                j.property('init', j.stringLiteral(k), j.stringLiteral(String(v))),
+              ),
+            ),
+          ),
+        ])
+      : j.objectExpression([]);
+
+  // getMessageFallback={({ key }) => key} — an arrow returning the key string.
+  const fallbackArrow = j.arrowFunctionExpression(
+    [j.objectPattern([
+      Object.assign(j.property('init', j.identifier('key'), j.identifier('key')), { shorthand: true }),
+    ])],
+    j.identifier('key'),
+  );
+
   const open = j.jsxOpeningElement(
     j.jsxIdentifier('NextIntlClientProvider'),
     [
       j.jsxAttribute(j.jsxIdentifier('locale'), j.stringLiteral('en')),
-      j.jsxAttribute(
-        j.jsxIdentifier('messages'),
-        j.jsxExpressionContainer(j.objectExpression([])),
-      ),
+      j.jsxAttribute(j.jsxIdentifier('messages'), j.jsxExpressionContainer(messagesObj)),
       j.jsxAttribute(j.jsxIdentifier('timeZone'), j.stringLiteral('UTC')),
+      j.jsxAttribute(
+        j.jsxIdentifier('onError'),
+        j.jsxExpressionContainer(j.arrowFunctionExpression([], j.blockStatement([]))),
+      ),
+      j.jsxAttribute(j.jsxIdentifier('getMessageFallback'), j.jsxExpressionContainer(fallbackArrow)),
     ],
     false,
   );
@@ -266,7 +302,7 @@ function isProviderWrapped(node) {
 // it returns { changed:false } with a reason and the SKILL falls back to a manual
 // instruction — the test is STILL backed up by the caller, so rollback stays
 // coherent either way.
-function wrapTestWithProvider(source) {
+function wrapTestWithProvider(source, namespace, keys) {
   let root;
   try {
     root = jTest(source);
@@ -291,7 +327,7 @@ function wrapTestWithProvider(source) {
       return;
     }
     if (arg0.type === 'JSXElement' || arg0.type === 'JSXFragment') {
-      p.node.arguments[0] = buildProviderWrap(jTest, arg0);
+      p.node.arguments[0] = buildProviderWrap(jTest, arg0, namespace, keys);
       wrapped += 1;
       return;
     }
@@ -369,7 +405,17 @@ function wrapTestWithProvider(source) {
 // backup API (which joins appRoot) and for reporting catalog paths consistently
 // with the staged manifest (which already stores rel paths).
 function relToRoot(appRoot, absPath) {
-  let rel = absPath.startsWith(appRoot) ? absPath.slice(appRoot.length) : absPath;
+  // Normalize BOTH sides to posix before the prefix test. `appRoot` may arrive
+  // posix-style (inventory.app.root is stored "C:/…") while absPath is built via
+  // node's join() and so is platform-native ("C:\…" on Windows). A raw
+  // startsWith over mixed separators is false on Windows, so relToRoot would
+  // hand back the full ABSOLUTE path; a downstream join(appRoot, that) then
+  // doubles the root ("…\app\C:\…\app\messages\en.json" → ENOENT). Compare on a
+  // common separator, case-insensitively for the Windows drive letter.
+  const aRootPosix = appRoot.split('\\').join('/');
+  const aAbsPosix = absPath.split('\\').join('/');
+  const matches = aAbsPosix.toLowerCase().startsWith(aRootPosix.toLowerCase());
+  const rel = matches ? aAbsPosix.slice(aRootPosix.length) : aAbsPosix;
   return rel.replace(/^[/\\]+/, '').split(sep).join('/').split('\\').join('/');
 }
 
@@ -817,7 +863,9 @@ export function extract(inventory, options = {}) {
       for (const testRel of collateralTests) {
         const testBackup = batch.backupFile(testRel);
         const testSrc = readFileSync(join(appRoot, testRel), 'utf8');
-        const wrap = wrapTestWithProvider(testSrc);
+        // Seed the wrapper with the namespace block this run extracted so the
+        // component's t() calls resolve (non-throwing fallback covers the rest).
+        const wrap = wrapTestWithProvider(testSrc, namespace, out.keys);
         if (wrap.changed) writeFileSync(join(appRoot, testRel), wrap.code, 'utf8');
         // per-RENDER-CALL accounting: a test file with N render() calls reports how
         // many were provider-wrapped vs how many still need a hand wrap. A file
@@ -1032,7 +1080,14 @@ export function promoteStaged(appRoot, file, options = {}) {
     if (!existsSync(join(appRoot, testRel))) continue;
     const testBackup = batch.backupFile(testRel);
     const testSrc = readFileSync(join(appRoot, testRel), 'utf8');
-    const wrap = wrapTestWithProvider(testSrc);
+    // stagedKeys for a FLAT catalog is { "<NS>": {…} }; for SPLIT it is the flat
+    // key→text map directly. Pass the namespace block so the wrapper seeds real
+    // messages and the promoted component's t() calls resolve.
+    const nsKeys =
+      stagedKeys && typeof stagedKeys[entry.namespace] === 'object'
+        ? stagedKeys[entry.namespace]
+        : stagedKeys;
+    const wrap = wrapTestWithProvider(testSrc, entry.namespace, nsKeys);
     if (wrap.changed) writeFileSync(join(appRoot, testRel), wrap.code, 'utf8');
     testEdits.push({
       file: testRel,

@@ -136,6 +136,17 @@ describe('jest patch — the transformIgnorePatterns ESM allowlist is injected',
   test('the exported ESM_ALLOWLIST is the four ESM-only i18n packages', () => {
     expect(ESM_ALLOWLIST).toEqual(['next-intl', 'use-intl', 'intl-messageformat', '@formatjs']);
   });
+
+  // DEFECT 5 (full M10 dogfood): the plugin's own .vibe-lingual/ backups mirror
+  // the source tree, INCLUDING *.test.tsx copies — jest globs them as live suites
+  // and the bare pre-wrap copies fail (No intl context). The jest patch must add
+  // .vibe-lingual/ to testPathIgnorePatterns so test discovery skips them.
+  test('the jest patch excludes .vibe-lingual/ from test discovery', () => {
+    const set = wire({ detection: detect(fixture('app-router-no-intl')) });
+    const patch = findPatch(set, 'jest-transform-ignore');
+    expect(patch.snippet).toContain('testPathIgnorePatterns');
+    expect(patch.snippet).toContain('<rootDir>/.vibe-lingual/');
+  });
 });
 
 describe('reuse — an existing language list drives the UI locale set', () => {
