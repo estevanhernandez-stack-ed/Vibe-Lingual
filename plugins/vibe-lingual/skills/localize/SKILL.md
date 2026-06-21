@@ -26,8 +26,8 @@ If `inventory.json` or `audit.json` is missing, tell the user to run `/vibe-ling
 |---|---|
 | `--dry-run` | Plan + route every file, write NOTHING. The preview gate — run this first on any real app. |
 | `--rollback <ISO-timestamp>` | Restore a prior backup batch (exact byte-for-byte). Accepts the raw ISO timestamp or the safe batch id. |
-| `--stage-all` | Route every file to staging regardless of confidence (cautious first pass). |
-| `--apply-staged <file>` | Promote a previously-staged rewrite from `.vibe-lingual/localize/staged/` to the live source (after the user reviewed it). |
+| `--stage-all` | Route every file to staging regardless of confidence (the cautious first pass — even high-confidence files stage). Backed by the engine (`extract … --stage-all`); a blocked file still stays inline-only (the audit gate wins over force-stage). |
+| `--apply-staged <file>` | Promote a previously-staged rewrite (the LIVE rel path, e.g. `src/components/Card.tsx`) from the staged mirror to live source, after the user reviewed it. Backed by the engine (`extract … --apply-staged <file>`): backup live (+ its collateral test) → write live → merge the staged catalog into the live catalog → ledger → drop the staged entry. Reversible by batch. |
 | `--phase <name>` | Run a single phase only (`extract` / `wire` / `translate` / `wire-to-locale` / `guard`). Default runs the whole loop. |
 
 ## The confidence routing (KTD-2)
@@ -37,7 +37,7 @@ A file's routing confidence is the **most-cautious** of its included sites — o
 | File confidence | Route | What happens |
 |---|---|---|
 | **high** (every site high) | **auto-write** | Backup FIRST → codemod rewrites the live source → namespaced catalog merged (atomic). Recorded in the extract ledger for resumability. |
-| **medium** | **stage** | The rewrite + catalog are written to `.vibe-lingual/localize/staged/<file>` for review. Live source UNTOUCHED. Promote with `--apply-staged`. |
+| **medium** | **stage** | The rewrite + catalog are written to `.vibe-lingual/localize/staged/<file>` for review, and a `staged-manifest.json` entry records the read-back contract (live target, namespace, catalog paths, collateral tests). Live source UNTOUCHED. Promote with `--apply-staged <live-rel-path>` once reviewed. |
 | **low** | **inline-only** | A suggestion surfaced in the banner. No write at all. |
 | **blocked** (audit readiness) | **inline-only** | A firebase-admin SSR file or an unhandled dynamic-route glob NEVER auto-writes, regardless of confidence. The block reason is surfaced. |
 
@@ -99,9 +99,11 @@ Emit the two guards:
 - **Parity test** — `node engine/cli.mjs parity <appRoot> --messages <dir>` verifies recursive key-path parity across catalogs (catches BOTH missing AND extra keys). Write the `emitParityTest` output into the app's test suite. This is the single highest-value reusable guard.
 - **jsx-no-literals ratchet** — flip `react/jsx-no-literals` to `error` per **FULLY-extracted file** (it is noisy on partially-extracted files). The guard emitter globs dynamic-route segments with `*` (never the literal `[param]`, which silently never matches) and self-verifies via `eslint --print-config`.
 
-### 9. Test-harness collateral
+### 9. Test-harness collateral (engine-driven)
 
-Adding next-intl hooks to a component breaks its EXISTING tests — they now need a `NextIntlClientProvider` wrapper. For each touched component that has a co-located test, wrap the rendered component in `<NextIntlClientProvider locale="en" messages={...}>` (tests pin `timeZone="UTC"` for determinism only). This is mechanical and automatable — do it as part of the extract phase output, not a surprise the user discovers when the suite goes red. Back up each test file before editing it.
+Adding next-intl hooks to a component breaks its EXISTING tests — they now need a `NextIntlClientProvider` wrapper. This is **handled by the extract engine, not by hand** (the cowpath called it mechanical/automatable): for every auto-written component the engine discovers a co-located test (`<Base>.test.tsx` / `.spec.tsx`, sibling or under `__tests__/`), **backs it up INTO the same batch** (so `--rollback` returns the repo to a coherent pre-localize state — component AND test both restored), and provider-wraps it (`<NextIntlClientProvider locale="en" messages={{}} timeZone="UTC">` around each `render(...)`). The same happens on `--apply-staged` promotion.
+
+Read the run-report's `collateralTests[]` (per result) and `summary.collateralTests` / `collateralTestsWrapped` / `collateralTestsNeedManualWrap`. If `collateralTestsNeedManualWrap > 0`, the engine couldn't auto-wrap a test cleanly (no `render(<JSX>)` call found, or already wrapped) — those entries carry a `reason`; surface them so the user wraps them by hand. The test is still backed up either way, so rollback stays coherent. Fill real `messages` for the namespace when you know it (the engine leaves `messages={{}}`, which next-intl tolerates by echoing the key).
 
 ### 10. Confirm + banner
 
@@ -114,12 +116,14 @@ After the loop, run the app's test suite if present — a passing suite is the t
 App:        <appRoot>   Adapter: next-intl (App Router)
 
 Extract:    <w> written · <s> staged · <i> inline-only · <b> blocked · <k> keys
+Tests:      <ct> co-located test(s) — <cw> provider-wrapped, <cm> need a manual wrap
 Wired:      request.ts · locale-cookie.ts · provider · next.config · jest ESM patch
 Catalogs:   messages/en/*.json (source) · <N> locale(s) drafted, <M> marked untranslated
 Guard:      parity test emitted · jsx-no-literals ratcheted on <g> file(s)
 
 Backup batch: <batchId>   (rollback: /vibe-lingual:localize --rollback <batchId>)
-Staged:       <staged-count> file(s) in .vibe-lingual/localize/staged/ — review then --apply-staged
+Staged:       <staged-count> file(s) in .vibe-lingual/localize/staged/ — review then
+              --apply-staged <live-rel-path> (e.g. src/components/Card.tsx)
 
 Next: review staged files, run your test suite, then translate the marked locales.
 ```
@@ -137,7 +141,8 @@ See the family `friction-triggers` convention. Highlights:
 ## Never
 
 - Mutate source without writing the backup FIRST. Order is backup → write → merge catalog → ledger, always.
-- Auto-write a file below the high-confidence bar without the user's go (medium stages, low is inline-only). `--stage-all` is the conservative default for a first pass.
+- Auto-write a file below the high-confidence bar without the user's go (medium stages, low is inline-only). `--stage-all` forces every file to stage — the conservative default for a first pass.
+- Edit a co-located test as collateral of a write WITHOUT putting it through the same backup batch first. A test edit outside the batch breaks the "rollback restores exactly" guarantee (the component reverts, the test stays wrapped). The engine backs the test up before wrapping; never hand-edit a test the engine left unwrapped without backing it up into the run's batch yourself.
 - Auto-write a blocked file (firebase-admin SSR / unhandled dynamic-route glob). Audit readiness is the gate.
 - Auto-resolve the REQUIRED timeZone decision. Surface it; let the user pick.
 - Clobber a catalog. Merge — existing keys win; a human-edited translation is never stomped.

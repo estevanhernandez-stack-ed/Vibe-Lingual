@@ -25,7 +25,7 @@ Load `vibe-lingual:guide` first. Then read target-app state and route. Routing o
 
 4. **A backup batch exists but staged rewrites are pending** → review-staged branch.
    - Triggered when `.vibe-lingual/localize/staged/` is non-empty.
-   - Render the staged file list. Offer: review a staged rewrite, promote one (`/vibe-lingual:localize --apply-staged <file>`), or re-run the loop.
+   - Render the staged file list (read `.vibe-lingual/localize/staged/staged-manifest.json` for the live targets). Offer: review a staged rewrite, promote one (`/vibe-lingual:localize --apply-staged <live-rel-path>`, e.g. `src/components/Card.tsx`), or re-run the loop.
    - Wait for the user to choose.
 
 5. **Extraction has run (ledger exists) + catalogs exist** → guard/translate posture.

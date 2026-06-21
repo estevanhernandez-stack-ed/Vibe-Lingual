@@ -11,7 +11,7 @@ import { scan } from './scan.mjs';
 import { brief } from './brief.mjs';
 import { audit } from './audit.mjs';
 import { auditReport } from './audit-report.mjs';
-import { extract } from './extract.mjs';
+import { extract, promoteStaged } from './extract.mjs';
 import { rollback as rollbackBatch } from './backup.mjs';
 import { resolveAdapter } from './adapters/index.mjs';
 import { verifyParity } from './parity.mjs';
@@ -31,6 +31,8 @@ function usage() {
     '            i18n-retrofit gotcha + per-file readiness + phased-plan analysis',
     '  extract <appRoot> --inventory <path> [--audit <path>] [options]',
     '            run the confidence-routed codemod over the inventory file set',
+    '            (--stage-all forces every file to staging; --apply-staged <file>',
+    '            promotes one staged rewrite to live source with backup)',
     '  wire <appRoot> [--locales a,b,c] [--source-locale en]',
     '            emit the next-intl wiring plan (request, locale cookie, patches)',
     '  parity <appRoot> --messages <dir> [--source-locale en]',
@@ -56,6 +58,10 @@ function usage() {
     '  --messages <dir>     catalog dir, relative to <appRoot> (default: messages).',
     '  --source-locale <c>  locale the catalogs are written under (default: en).',
     '  --dry-run            plan + route every file, write NOTHING (preview).',
+    '  --stage-all          force EVERY file to staging regardless of confidence',
+    '                       (the cautious first pass — even high-confidence files stage).',
+    '  --apply-staged <f>   promote ONE staged rewrite (live rel path) from the staged',
+    '                       mirror to live source, backed up first. Reversible by batch.',
     '  --rollback <id>      restore a prior backup batch (ISO timestamp or batch id).',
     '',
     'wire flags:',
@@ -257,6 +263,33 @@ function runExtract(argv) {
     return 0;
   }
 
+  // --apply-staged <file> short-circuits too: promote ONE staged rewrite to live
+  // source (backed up first). Mirrors the sibling /vibe-prompt:remediate
+  // --apply-pending — the staged-promotion path is backed at the CLI layer, not
+  // left as a dead-end mirror the SKILL claims is promotable.
+  if (typeof args['apply-staged'] === 'string') {
+    const res = promoteStaged(root, args['apply-staged'], {
+      overwriteKeys: args['overwrite-keys'] === true,
+    });
+    if (!res.ok) {
+      console.error(`vibe-lingual extract --apply-staged: ${res.error}`);
+      console.log(JSON.stringify(res, null, 2));
+      return 1;
+    }
+    const wrapped = res.testEdits.filter((t) => t.wrapped).length;
+    const manual = res.testEdits.length - wrapped;
+    console.error(
+      `vibe-lingual extract: promoted ${res.file} → live source — ` +
+        `${res.keysMerged.added} key(s) added (${res.keysMerged.kept} kept), ` +
+        `backup batch ${res.batchId}.` +
+        (res.testEdits.length
+          ? ` ${wrapped} test(s) wrapped${manual ? `, ${manual} need a manual wrap` : ''}.`
+          : ''),
+    );
+    console.log(JSON.stringify(res, null, 2));
+    return 0;
+  }
+
   if (typeof args.inventory !== 'string') {
     console.error('vibe-lingual extract: --inventory <path> is required.');
     return 2;
@@ -286,6 +319,7 @@ function runExtract(argv) {
     sourceLocale: typeof args['source-locale'] === 'string' ? args['source-locale'] : undefined,
     dryRun: args['dry-run'] === true,
     overwriteKeys: args['overwrite-keys'] === true,
+    stageAll: args['stage-all'] === true,
   });
 
   const s = report.summary;
@@ -294,6 +328,11 @@ function runExtract(argv) {
       `${s.written} written · ${s.staged} staged · ${s.inlineOnly} inline-only · ` +
       `${s.blocked} blocked · ${s.skippedDone + s.skippedNoChange} skipped · ` +
       `${s.keysWritten} key(s) written.` +
+      (s.collateralTests
+        ? ` ${s.collateralTests} co-located test(s): ${s.collateralTestsWrapped} wrapped` +
+          (s.collateralTestsNeedManualWrap ? `, ${s.collateralTestsNeedManualWrap} need a manual wrap` : '') +
+          '.'
+        : '') +
       (report.batchId ? ` Backup batch ${report.batchId}.` : ''),
   );
   console.log(JSON.stringify(report, null, 2));
