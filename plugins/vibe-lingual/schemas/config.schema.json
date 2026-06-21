@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/estevanhernandez-stack-ed/Vibe-Lingual/schemas/config.schema.json",
+  "title": "vibe-lingual config",
+  "description": "Captured by `/vibe-lingual:first-run-setup` on first invocation in a target app. Records the detected framework + adapter + the soft decisions the localize loop reads (timeZone, dual-locale, locales, catalog layout). Lives at .vibe-lingual/config.json in the target app. Idempotent — re-running first-run-setup refreshes it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "framework", "adapter", "routerType", "sourceLocale", "messagesDir"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "framework": {
+      "type": "string",
+      "description": "The detected i18n framework (or 'none' for a greenfield retrofit).",
+      "enum": ["next-intl", "react-i18next", "react-intl", "lingui", "i18next", "none"]
+    },
+    "adapter": {
+      "type": "string",
+      "description": "The vibe-lingual adapter that claimed this app. v1 implements next-intl only; a non-match records 'not-yet-implemented' and localize refuses to mutate.",
+      "enum": ["next-intl", "not-yet-implemented"]
+    },
+    "routerType": { "type": "string", "enum": ["app", "pages", "unknown"] },
+    "sourceLocale": {
+      "type": "string",
+      "description": "The source-of-truth locale catalogs are authored in (always generated first; the AVAILABLE-list fallback target). Default 'en'."
+    },
+    "locales": {
+      "type": "array",
+      "description": "The UI locale set. Reuses a detected language list (e.g. SUPPORTED_LANGUAGES) when present; the source locale is forced first.",
+      "items": { "type": "string" }
+    },
+    "messagesDir": {
+      "type": "string",
+      "description": "Catalog directory, relative to the app root. Default 'messages'."
+    },
+    "catalogLayout": {
+      "type": "string",
+      "description": "split-by-namespace = messages/<locale>/<NS>.json (cowpath default); flat = messages/<locale>.json.",
+      "enum": ["split-by-namespace", "flat"],
+      "default": "split-by-namespace"
+    },
+    "cookieName": {
+      "type": "string",
+      "description": "The UI-locale cookie name. Default 'NEXT_LOCALE'."
+    },
+    "existingLanguageList": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "A detected app-owned language list reused for the UI picker (cowpath lesson: don't generate a parallel list).",
+      "required": ["file", "symbol"],
+      "properties": {
+        "file": { "type": "string" },
+        "symbol": { "type": "string" },
+        "codes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "decisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The resolved values for the audit-surfaced decisions the localize loop must NOT auto-pick. Captured once the user answers them.",
+      "properties": {
+        "timezone": {
+          "type": ["string", "null"],
+          "description": "The REQUIRED timeZone decision once answered: how locale-sensitive dates resolve their zone.",
+          "enum": ["client-browser-zone", "ssr-explicit-zone", "mixed", null]
+        },
+        "dualLocale": {
+          "type": ["string", "null"],
+          "description": "Whether UI locale is modeled separately from an existing content/output locale.",
+          "enum": ["separate", "lockstep", null]
+        },
+        "htmlLang": {
+          "type": ["string", "null"],
+          "description": "Whether to update <html lang> to lang={locale}.",
+          "enum": ["yes", "defer", null]
+        }
+      }
+    },
+    "confidenceThresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional per-app overrides for the localize confidence routing. Defaults: auto-write requires an all-high file, medium stages, low is inline-only.",
+      "properties": {
+        "autoWrite": { "type": "string", "enum": ["high", "medium", "low"], "default": "high" },
+        "stage": { "type": "string", "enum": ["high", "medium", "low"], "default": "medium" }
+      }
+    },
+    "capturedAt": { "type": "string", "description": "ISO timestamp of the first-run capture (or last refresh)." }
+  }
+}

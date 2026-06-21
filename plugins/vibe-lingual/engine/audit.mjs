@@ -411,6 +411,27 @@ function buildPhasedPlan(inv, gotchas, decisions) {
 export function audit(inventory, appRoot) {
   const inv = inventory;
 
+  // FAIL LOUD (M8 hardening). audit is only as good as the inventory it reads. A
+  // missing, malformed, or EMPTY inventory previously slipped through and emitted
+  // a report carrying only the always-on app-level RTL info gotcha — a vacuous
+  // "clean" surface that hides the fact nothing was scanned. Refuse it: throw a
+  // clear error so the caller (CLI → non-zero exit; SKILL → abort + friction-log)
+  // stops instead of trusting a hollow report.
+  if (inv == null || typeof inv !== 'object') {
+    throw new Error('audit: inventory is missing or not an object — run scan first to produce inventory.json.');
+  }
+  if (!Array.isArray(inv.sites) || !Array.isArray(inv.componentsByDensity)) {
+    throw new Error(
+      'audit: inventory is malformed (missing sites[] / componentsByDensity[]) — re-run scan to regenerate it.',
+    );
+  }
+  if (inv.sites.length === 0 && inv.componentsByDensity.length === 0) {
+    throw new Error(
+      'audit: inventory is EMPTY (zero string sites and zero files with localizable work). ' +
+        'Nothing to audit — re-run scan against the correct app root.',
+    );
+  }
+
   const firebaseGotchas = firebaseAdminGotchas(inv, appRoot);
   const structural = structuralIntlGotchas(inv);
   const timezone = timezoneGotchas(inv);
