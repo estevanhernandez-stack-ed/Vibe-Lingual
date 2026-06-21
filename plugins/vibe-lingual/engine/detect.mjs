@@ -169,10 +169,20 @@ const I18N_SCAN_ROOTS = ['src', 'lib', 'app', 'config', '.'];
 const LANGUAGE_LIST_RE =
   /\b(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Z0-9_]*(?:LANGUAGES|LOCALES|LANGS))\b[^=\n]*=\s*\[/m;
 
-// Declaration / field of an output-language-shaped locale pref.
-// e.g. `outputLanguage?: string` / `outputLanguage: "en"` / `let outputLanguage =`
+// Declaration of an output-language-shaped locale pref — a real declaration
+// site, never a usage. Three accepted forms, all genuine declarations:
+//   (1) `const|let|var outputLanguage =` — keyword MANDATORY (mirrors
+//       LANGUAGE_LIST_RE), so a JSX attribute `uiLanguage={…}` or an object
+//       property `{ uiLanguage: code }` no longer masquerades as a declaration.
+//   (2) `uiLanguage?: string` — an optional TS type/interface field. The `?:`
+//       form is unique to type fields; expressions never carry it.
+//   (3) `outputLanguage: string` — a required TS type/interface field, where the
+//       RHS is a *type* (a bareword identifier / union), NOT a value expression.
+//       This is what separates a type field from an object-literal property whose
+//       value is a string/number/JSX expression (`uiLanguage: "en"`, `={…}`).
+// Capture group lands in m[1]|m[2]|m[3] depending on which form matched.
 const LOCALE_PREF_RE =
-  /\b(?:export\s+)?(?:const|let|var\s+)?(outputLanguage|uiLanguage|localePreference|preferredLocale)\b\s*[?:=]/m;
+  /\b(?:export\s+)?(?:(?:const|let|var)\s+(outputLanguage|uiLanguage|localePreference|preferredLocale)\b\s*[:=]|(outputLanguage|uiLanguage|localePreference|preferredLocale)\s*\?\s*:\s*[A-Za-z_$][\w$.<>[\] |]*|(outputLanguage|uiLanguage|localePreference|preferredLocale)\s*:\s*[A-Za-z_$][\w$.<>[\] |]*\s*[;\n])/m;
 
 function listAppFiles(root) {
   const files = [];
@@ -223,7 +233,9 @@ function detectExistingI18n(root, framework) {
     if (!localePref) {
       const m = text.match(LOCALE_PREF_RE);
       if (m) {
-        localePref = { file: toPosix(relative(root, file)), symbol: m[1] };
+        // Three declaration forms → symbol is in whichever alternation matched.
+        const symbol = m[1] || m[2] || m[3];
+        localePref = { file: toPosix(relative(root, file)), symbol };
       }
     }
     if (languageList && localePref) break;

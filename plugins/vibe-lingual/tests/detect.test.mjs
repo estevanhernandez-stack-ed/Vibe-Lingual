@@ -38,13 +38,14 @@ describe('detect — (a) App Router, next-intl ABSENT, SUPPORTED_LANGUAGES prese
     });
   });
 
-  test('finds an outputLanguage-shaped locale pref with file + symbol', () => {
+  test('finds an outputLanguage-shaped locale pref at the declaration site', () => {
     expect(result.existingI18n.localePref).not.toBeNull();
     expect(result.existingI18n.localePref.symbol).toBe('outputLanguage');
-    // First declaration site wins; both languages.ts and types/preferences.ts declare it.
-    expect(['src/lib/languages.ts', 'src/types/preferences.ts']).toContain(
-      result.existingI18n.localePref.file,
-    );
+    // Deterministic, not order-tolerant. languages.ts declares it as a real
+    // `let outputLanguage =` binding and sorts ahead of types/preferences.ts in
+    // walk order (src/lib/ before src/types/), so it wins — and it IS a genuine
+    // declaration, so the pick is correct, not merely accepted.
+    expect(result.existingI18n.localePref.file).toBe('src/lib/languages.ts');
   });
 
   test('root is echoed back on the app object', () => {
@@ -113,6 +114,34 @@ describe('detect — (c) Pages Router', () => {
       languageList: null,
       localePref: null,
     });
+  });
+});
+
+describe('detect — (d) locale pref: usage site BEFORE declaration in walk order', () => {
+  // Regression guard for the M1 detection bug. A JSX-prop usage + an object
+  // property (`uiLanguage={…}`, `{ uiLanguage: code }`) live in
+  // src/components/Calibration.tsx, which walks BEFORE the real declaration in
+  // src/types/preferences.ts (components/ sorts ahead of types/). The old
+  // LOCALE_PREF_RE made the const|let|var keyword optional and matched any
+  // `symbol [?:=]`, so it stopped at the first usage site and reported a
+  // component file as the source of truth — the exact Celestia3 dogfood failure
+  // (CosmicCalibration.tsx:416 instead of src/types/preferences.ts). The engine
+  // must skip both usage sites and resolve to the declaration.
+  const result = detect(fixture('app-router-pref-usage-before-decl'));
+
+  test('resolves to the declaration file, not the earlier usage component', () => {
+    expect(result.existingI18n.localePref).not.toBeNull();
+    expect(result.existingI18n.localePref.file).toBe('src/types/preferences.ts');
+  });
+
+  test('the resolved symbol is an output-language-shaped pref', () => {
+    expect(['outputLanguage', 'uiLanguage']).toContain(
+      result.existingI18n.localePref.symbol,
+    );
+  });
+
+  test('does NOT report the usage component (components/Calibration.tsx)', () => {
+    expect(result.existingI18n.localePref.file).not.toBe('src/components/Calibration.tsx');
   });
 });
 
