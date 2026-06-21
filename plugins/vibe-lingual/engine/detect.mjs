@@ -181,8 +181,85 @@ const LANGUAGE_LIST_RE =
 //       This is what separates a type field from an object-literal property whose
 //       value is a string/number/JSX expression (`uiLanguage: "en"`, `={…}`).
 // Capture group lands in m[1]|m[2]|m[3] depending on which form matched.
+//
+// Forms (2)/(3) match ANY TS interface/type field — including a component's
+// `*Props` interface (`interface LanguageSettingsProps { uiLanguage: string; }`).
+// That is NOT the app locale-preference declaration; it is a prop wiring. The
+// matcher below is therefore only the first gate — `classifyLocalePref` decides
+// whether a form-(2)/(3) hit lives in a real preferences/settings interface or a
+// component props interface, and a resolution tier picks the strongest candidate
+// across all files instead of trusting first-walk-wins. See the Celestia3 dogfood
+// failure (LanguageSettings.tsx:9 props field vs src/types/preferences.ts:73).
 const LOCALE_PREF_RE =
-  /\b(?:export\s+)?(?:(?:const|let|var)\s+(outputLanguage|uiLanguage|localePreference|preferredLocale)\b\s*[:=]|(outputLanguage|uiLanguage|localePreference|preferredLocale)\s*\?\s*:\s*[A-Za-z_$][\w$.<>[\] |]*|(outputLanguage|uiLanguage|localePreference|preferredLocale)\s*:\s*[A-Za-z_$][\w$.<>[\] |]*\s*[;\n])/m;
+  /\b(?:export\s+)?(?:(?:const|let|var)\s+(outputLanguage|uiLanguage|localePreference|preferredLocale)\b\s*[:=]|(outputLanguage|uiLanguage|localePreference|preferredLocale)\s*\?\s*:\s*[A-Za-z_$][\w$.<>[\] |]*|(outputLanguage|uiLanguage|localePreference|preferredLocale)\s*:\s*[A-Za-z_$][\w$.<>[\] |]*\s*[;\n])/;
+
+// An interface/type whose name ends in Props/PropTypes/State is a React
+// component's prop/state shape, NOT an app preference store. A locale field
+// inside one of these is prop wiring (`<LanguageSettings uiLanguage=…/>`), never
+// the source-of-truth declaration. Reject it.
+const COMPONENT_IFACE_NAME_RE = /(?:Props|PropTypes|State)$/;
+
+// An interface/type whose name reads like a user-preference / settings / config
+// store is the canonical home for the locale pref. A field here is the real
+// declaration even if the file walks late.
+const PREF_IFACE_NAME_RE = /(?:Preferences|Prefs|Settings|Config|UserProfile|Profile)$/;
+
+// Given file text and the byte offset of a form-(2)/(3) field match, find the
+// name of the nearest enclosing `interface X` / `type X =` declaration above it.
+// Lexical, brace-naive (good enough: we only need the nearest declarator name,
+// and TS forbids re-opening an interface mid-body). Returns null if the field is
+// not inside a named interface/type (e.g. an inline object type) — treated as
+// neutral, not a component.
+function enclosingTypeName(text, offset) {
+  const before = text.slice(0, offset);
+  const re = /(?:export\s+)?(?:interface|type)\s+([A-Za-z_$][\w$]*)/g;
+  let name = null;
+  let m;
+  while ((m = re.exec(before)) !== null) {
+    name = m[1];
+  }
+  return name;
+}
+
+// Classify a single locale-pref candidate found in `text`. Returns
+// `{ symbol, tier }` or null if the candidate must be rejected (component-props
+// field). Higher tier wins across files:
+//   3 — binding form (1): `const|let|var outputLanguage =`. Unambiguous.
+//   3 — type field inside a *Preferences/*Settings/*Config-shaped interface.
+//   2 — type field inside any other (non-component) named interface/type.
+//   1 — type field not inside a named interface (inline/anonymous object type).
+//   reject — type field inside a *Props/*State component interface.
+function classifyLocalePref(text) {
+  const m = LOCALE_PREF_RE.exec(text);
+  if (!m) return null;
+
+  // Form (1): a real binding. Always strong, no enclosing-type check needed.
+  if (m[1]) return { symbol: m[1], tier: 3 };
+
+  // Forms (2)/(3): a type/interface field. Decide by the enclosing declarator.
+  const symbol = m[2] || m[3];
+  const iface = enclosingTypeName(text, m.index);
+
+  if (iface && COMPONENT_IFACE_NAME_RE.test(iface)) {
+    // `LanguageSettingsProps.uiLanguage` and friends — prop wiring, not the pref.
+    return null;
+  }
+  if (iface && PREF_IFACE_NAME_RE.test(iface)) return { symbol, tier: 3 };
+  if (iface) return { symbol, tier: 2 };
+  return { symbol, tier: 1 };
+}
+
+// A path under types/ or config/ (and NOT under components/) is the structural
+// home for a preference declaration; rank it above a field that only appears in
+// a component module. This is a tiebreaker WITHIN a tier, layered on top of the
+// interface-name classification so the resolution never depends on walk order.
+function localePrefPathBonus(relPosix) {
+  const inComponents = /(^|\/)components(\/|$)/.test(relPosix);
+  const inTypesOrConfig = /(^|\/)(types|config)(\/|$)/.test(relPosix);
+  if (inTypesOrConfig) return 2;
+  if (inComponents) return 0;
+  return 1;
+}
 
 function listAppFiles(root) {
   const files = [];
@@ -218,29 +295,40 @@ function walkSourceFiles(dir, acc, seen, root) {
 function detectExistingI18n(root, framework) {
   const lib = framework === 'none' ? null : framework;
   let languageList = null;
-  let localePref = null;
+
+  // The language list is unambiguous (ALL-CAPS symbol + array literal), so
+  // first-match-wins is fine there. The locale pref is NOT — a component props
+  // field matches the same shape as the real declaration, so we must score every
+  // candidate and keep the strongest rather than stop at the first file walked.
+  // Score = (tier, pathBonus); higher wins, ties keep the earlier walk position.
+  let bestPref = null; // { file, symbol, tier, pathBonus }
 
   for (const file of listAppFiles(root)) {
     const text = readText(file);
     if (!text) continue;
+    const relPosix = toPosix(relative(root, file));
 
     if (!languageList) {
       const m = text.match(LANGUAGE_LIST_RE);
       if (m) {
-        languageList = { file: toPosix(relative(root, file)), symbol: m[1] };
+        languageList = { file: relPosix, symbol: m[1] };
       }
     }
-    if (!localePref) {
-      const m = text.match(LOCALE_PREF_RE);
-      if (m) {
-        // Three declaration forms → symbol is in whichever alternation matched.
-        const symbol = m[1] || m[2] || m[3];
-        localePref = { file: toPosix(relative(root, file)), symbol };
+
+    const candidate = classifyLocalePref(text);
+    if (candidate) {
+      const pathBonus = localePrefPathBonus(relPosix);
+      const better =
+        !bestPref ||
+        candidate.tier > bestPref.tier ||
+        (candidate.tier === bestPref.tier && pathBonus > bestPref.pathBonus);
+      if (better) {
+        bestPref = { file: relPosix, symbol: candidate.symbol, tier: candidate.tier, pathBonus };
       }
     }
-    if (languageList && localePref) break;
   }
 
+  const localePref = bestPref ? { file: bestPref.file, symbol: bestPref.symbol } : null;
   return { lib, languageList, localePref };
 }
 

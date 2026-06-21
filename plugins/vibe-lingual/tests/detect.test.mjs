@@ -38,14 +38,18 @@ describe('detect — (a) App Router, next-intl ABSENT, SUPPORTED_LANGUAGES prese
     });
   });
 
-  test('finds an outputLanguage-shaped locale pref at the declaration site', () => {
+  test('finds an outputLanguage-shaped locale pref at the canonical declaration site', () => {
     expect(result.existingI18n.localePref).not.toBeNull();
     expect(result.existingI18n.localePref.symbol).toBe('outputLanguage');
-    // Deterministic, not order-tolerant. languages.ts declares it as a real
-    // `let outputLanguage =` binding and sorts ahead of types/preferences.ts in
-    // walk order (src/lib/ before src/types/), so it wins — and it IS a genuine
-    // declaration, so the pick is correct, not merely accepted.
-    expect(result.existingI18n.localePref.file).toBe('src/lib/languages.ts');
+    // Two genuine declarations exist: a `let outputLanguage = 'en'` binding in
+    // src/lib/languages.ts (mutable runtime holder) and an `outputLanguage?:`
+    // field in the UserPreferences interface in src/types/preferences.ts (the
+    // type contract). Resolution is NOT walk-order; it scores candidates and
+    // keeps the strongest. The UserPreferences field wins on the pref-interface
+    // tier + types/ path bonus — the canonical home for the locale preference,
+    // which matches how the real Celestia3 reference is shaped. The pick is
+    // deterministic and intentional, not an accident of directory sort order.
+    expect(result.existingI18n.localePref.file).toBe('src/types/preferences.ts');
   });
 
   test('root is echoed back on the app object', () => {
@@ -142,6 +146,39 @@ describe('detect — (d) locale pref: usage site BEFORE declaration in walk orde
 
   test('does NOT report the usage component (components/Calibration.tsx)', () => {
     expect(result.existingI18n.localePref.file).not.toBe('src/components/Calibration.tsx');
+  });
+});
+
+describe('detect — (e) locale pref: component PROPS-INTERFACE field BEFORE the real declaration', () => {
+  // Regression guard for the live Celestia3 defect the (d) fixture missed.
+  // (d) only modeled JSX-attr + object-property USAGES — shapes the regex
+  // already rejected on form alone. This fixture models the shape that actually
+  // broke on the real app: an earlier-walking component file
+  // (src/components/settings/LanguageSettings.tsx) declares a *Props-interface
+  // field `uiLanguage: string;` — form (3) `<symbol>: <type>;`, identical in
+  // shape to the real declaration, so the bare LOCALE_PREF_RE matches it. Because
+  // src/components/ walks before src/types/, the wrong file won (the engine
+  // returned LanguageSettings.tsx:9 instead of src/types/preferences.ts, exactly
+  // mirroring the cowpath's CosmicCalibration.tsx:416-vs-preferences.ts:73
+  // failure). The detector must reject the *Props field (component prop wiring,
+  // not the app pref) and resolve to the UserPreferences declaration.
+  const result = detect(fixture('app-router-props-iface-before-decl'));
+
+  test('resolves to the real UserPreferences declaration, not the props interface', () => {
+    expect(result.existingI18n.localePref).not.toBeNull();
+    expect(result.existingI18n.localePref.file).toBe('src/types/preferences.ts');
+  });
+
+  test('does NOT report the component props interface file', () => {
+    expect(result.existingI18n.localePref.file).not.toBe(
+      'src/components/settings/LanguageSettings.tsx',
+    );
+  });
+
+  test('the resolved symbol is an output-language-shaped pref', () => {
+    expect(['outputLanguage', 'uiLanguage']).toContain(
+      result.existingI18n.localePref.symbol,
+    );
   });
 });
 

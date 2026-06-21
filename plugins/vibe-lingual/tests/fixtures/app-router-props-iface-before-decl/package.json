@@ -1,0 +1,12 @@
+{
+  "name": "fixture-pref-props-iface-before-decl",
+  "private": true,
+  "scripts": {
+    "dev": "next dev"
+  },
+  "dependencies": {
+    "next": "16.0.0",
+    "next-intl": "4.0.0",
+    "react": "19.0.0"
+  }
+}
