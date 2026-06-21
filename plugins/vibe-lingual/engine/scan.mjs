@@ -29,6 +29,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative, sep, basename, dirname } from 'node:path';
 import { parse } from '@babel/parser';
+import { buildIgnoreMatcher } from './ignore.mjs';
 
 // ---------------------------------------------------------------------------
 // file discovery — component files only (.tsx/.jsx and their .ts/.js siblings
@@ -45,7 +46,7 @@ function toPosix(p) {
   return p.split(sep).join('/');
 }
 
-function walkSourceFiles(dir, acc, seen, root) {
+function walkSourceFiles(dir, acc, seen, root, isIgnored) {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -54,11 +55,19 @@ function walkSourceFiles(dir, acc, seen, root) {
   }
   for (const entry of entries) {
     const full = join(dir, entry.name);
+    const relPosix = toPosix(relative(root, full));
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
-      walkSourceFiles(full, acc, seen, root);
+      // App/eslint/git ignore signals: prune an ignored directory at the walk so
+      // its whole subtree is skipped (a separate package like functions/, dead
+      // code like legacy/). Conservative — only prune when the matcher is present.
+      if (isIgnored && isIgnored(relPosix)) continue;
+      walkSourceFiles(full, acc, seen, root, isIgnored);
     } else if (entry.isFile() && COMPONENT_EXT_RE.test(entry.name)) {
-      if (TEST_FILE_RE.test(toPosix(relative(root, full)))) continue;
+      if (TEST_FILE_RE.test(relPosix)) continue;
+      // a file the app ignores (a specific gitignored/eslint-ignored path) is not
+      // product UI — exclude it from the inventory.
+      if (isIgnored && isIgnored(relPosix)) continue;
       if (seen.has(full)) continue;
       seen.add(full);
       acc.push(full);
@@ -66,7 +75,7 @@ function walkSourceFiles(dir, acc, seen, root) {
   }
 }
 
-function listComponentFiles(root) {
+function listComponentFiles(root, isIgnored) {
   const files = [];
   const seen = new Set();
   for (const r of SCAN_ROOTS) {
@@ -77,7 +86,7 @@ function listComponentFiles(root) {
     } catch {
       continue;
     }
-    walkSourceFiles(start, files, seen, root);
+    walkSourceFiles(start, files, seen, root, isIgnored);
   }
   return files;
 }
@@ -749,7 +758,13 @@ function makeSite(file, line, kind, text, namespace) {
 const ALL_KINDS = ['jsx-text', 'placeholder', 'aria-label', 'title', 'alt', 'toast', 'date-intl'];
 
 export function scan(root, detection) {
-  const files = listComponentFiles(root);
+  // Build the app's ignore matcher (built-in defaults + .gitignore + .eslintignore
+  // + eslint.config.* globalIgnores). Files the app itself ignores — a separate
+  // package (functions/), dead code (legacy/) — are pruned from the inventory so
+  // the operator never has to hand-exclude them. Defensive: a missing/unparseable
+  // ignore file degrades to the built-in defaults, never throws.
+  const ignore = buildIgnoreMatcher(root, { extraExcludeDirs: [...SKIP_DIRS] });
+  const files = listComponentFiles(root, ignore.isIgnored);
   const sites = [];
   let parseErrors = 0;
 
@@ -805,7 +820,13 @@ export function scan(root, detection) {
   // JSON.stringify drops it and the schema's additionalProperties:false holds,
   // while brief.mjs can still read it off the in-memory object.
   Object.defineProperty(inventory, '_meta', {
-    value: { filesScanned: files.length, parseErrors },
+    value: {
+      filesScanned: files.length,
+      parseErrors,
+      // which ignore signals contributed (brief/diagnostics only — never persisted).
+      ignoreSources: ignore.sources,
+      ignorePatternCount: ignore.patternCount,
+    },
     enumerable: false,
     writable: false,
     configurable: true,

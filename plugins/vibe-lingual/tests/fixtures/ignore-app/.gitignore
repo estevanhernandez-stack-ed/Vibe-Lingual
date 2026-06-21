@@ -1,0 +1,14 @@
+# dependencies
+/node_modules
+/.next/
+/out/
+
+# build
+/build
+/dist
+
+# a throwaway scripts dir — gitignored, must not enter the inventory
+/scripts
+
+# misc
+.DS_Store

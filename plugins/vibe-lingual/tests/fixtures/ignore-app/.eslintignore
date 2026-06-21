@@ -1,0 +1,4 @@
+# legacy eslintignore file (gitignore syntax). Excludes a vendored dir that is not
+# covered by gitignore or the flat-config globalIgnores — proves the .eslintignore
+# signal is read independently.
+src/vendored/
