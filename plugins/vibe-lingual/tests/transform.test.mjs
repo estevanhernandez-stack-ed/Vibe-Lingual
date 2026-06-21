@@ -501,3 +501,136 @@ export default function C() {
     expect(r.first.code.match(/useTranslations\(/g).length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase-3 BUG-3 — the PER-SITE filter primitive. `sites` (allow) / `skipSites`
+// (deny) constrain which literals the codemod rewrites, so the extract engine can
+// extract a heavy mixed file's high-confidence sites while leaving its low ones
+// inline. The position key is `{ line, text? }` (a date-intl entry keys by line).
+// No filter → whole-file behavior (every existing test above relies on that).
+// ---------------------------------------------------------------------------
+describe('BUG-3 — per-site filter (sites / skipSites)', () => {
+  // three JSX-text sites on known lines for crisp position assertions.
+  const THREE = `"use client";
+export default function C() {
+  return (
+    <div>
+      <h1>First heading</h1>
+      <p>Second paragraph</p>
+      <span>Third label</span>
+    </div>
+  );
+}
+`;
+  // lines: <h1>=5, <p>=6, <span>=7.
+
+  test('sites ALLOW-list rewrites ONLY the listed positions; the rest stay literals', () => {
+    const out = transform(THREE, {
+      path: 'src/components/C.tsx',
+      sites: [
+        { line: 5, text: 'First heading' },
+        { line: 7, text: 'Third label' },
+      ],
+    });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("{t('firstHeading')}"); // allowed
+    expect(out.code).toContain("{t('thirdLabel')}"); // allowed
+    // the un-listed middle site stays an inline literal — NOT a t() call.
+    expect(out.code).toContain('<p>Second paragraph</p>');
+    expect(out.code).not.toContain("t('secondParagraph')");
+    // only the 2 allowed sites land in the catalog.
+    expect(Object.keys(out.keys).sort()).toEqual(['firstHeading', 'thirdLabel']);
+  });
+
+  test('skipSites DENY-list rewrites everything EXCEPT the listed positions', () => {
+    const out = transform(THREE, {
+      path: 'src/components/C.tsx',
+      skipSites: [{ line: 6, text: 'Second paragraph' }],
+    });
+    expect(out.code).toContain("{t('firstHeading')}");
+    expect(out.code).toContain("{t('thirdLabel')}");
+    // the denied site stays inline.
+    expect(out.code).toContain('<p>Second paragraph</p>');
+    expect(out.code).not.toContain("t('secondParagraph')");
+  });
+
+  test('a text-bearing allow entry does NOT match a DIFFERENT literal on the same line', () => {
+    // two sites share a line: only the one whose text matches is rewritten.
+    const sameLine = `"use client";
+export default function C() {
+  return <div><strong>Keep me</strong> and <em>Wrap me</em></div>;
+}
+`;
+    // both <strong>Keep me</strong> and <em>Wrap me</em> sit on line 3.
+    const out = transform(sameLine, {
+      path: 'src/components/C.tsx',
+      sites: [{ line: 3, text: 'Wrap me' }],
+    });
+    expect(out.code).toContain("{t('wrapMe')}"); // matched by line+text
+    expect(out.code).toContain('Keep me'); // same line, different text → inline
+    expect(out.code).not.toContain("t('keepMe')");
+  });
+
+  test('an EMPTY sites list is treated as no-filter (whole-file), not extract-nothing', () => {
+    // buildSiteIndex returns null for an empty list, so an empty `sites` falls back
+    // to whole-file behavior. The extract engine never passes an empty list (it only
+    // filters when there ARE inline sites to exclude), so this documents the
+    // primitive's contract: a real partial run always passes a non-empty allow-set.
+    const out = transform(THREE, { path: 'src/components/C.tsx', sites: [] });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("{t('secondParagraph')}");
+  });
+
+  test('no filter → whole-file behavior (every site rewritten)', () => {
+    const out = transform(THREE, { path: 'src/components/C.tsx' });
+    expect(out.code).toContain("{t('firstHeading')}");
+    expect(out.code).toContain("{t('secondParagraph')}");
+    expect(out.code).toContain("{t('thirdLabel')}");
+  });
+
+  test('a date-intl allow entry (keyed by line) rewrites the display date', () => {
+    const dateSrc = `"use client";
+export default function C({ d }) {
+  return <span>{d.toLocaleDateString(undefined, { day: 'numeric' })}</span>;
+}
+`;
+    // the toLocaleDateString sits on line 3.
+    const out = transform(dateSrc, {
+      path: 'src/components/C.tsx',
+      sites: [{ line: 3, kind: 'date-intl' }],
+    });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain('format.dateTime(d');
+  });
+
+  test('a date-intl site NOT in the allow-set stays inline', () => {
+    const dateSrc = `"use client";
+export default function C({ d }) {
+  return (
+    <div>
+      <h1>Pick a date</h1>
+      <span>{d.toLocaleDateString(undefined, { day: 'numeric' })}</span>
+    </div>
+  );
+}
+`;
+    // allow only the heading (line 5); the date (line 6) must stay inline.
+    const out = transform(dateSrc, {
+      path: 'src/components/C.tsx',
+      sites: [{ line: 5, text: 'Pick a date' }],
+    });
+    expect(out.code).toContain("{t('pickADate')}");
+    expect(out.code).toContain('d.toLocaleDateString(undefined,'); // date untouched
+    expect(out.code).not.toContain('format.dateTime');
+  });
+
+  test('a filtered partial rewrite is idempotent on re-run', () => {
+    const opts = { path: 'src/components/C.tsx', sites: [{ line: 5, text: 'First heading' }] };
+    const first = transform(THREE, opts);
+    const second = transform(first.code, opts);
+    expect(second.changed).toBe(false);
+    expect(second.code).toBe(first.code);
+    // the unfiltered sites are still inline after both passes.
+    expect(first.code).toContain('<p>Second paragraph</p>');
+  });
+});

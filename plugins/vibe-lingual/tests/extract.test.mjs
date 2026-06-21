@@ -27,8 +27,30 @@ import { tmpdir } from 'node:os';
 import { detect } from '../engine/detect.mjs';
 import { scan } from '../engine/scan.mjs';
 import { audit } from '../engine/audit.mjs';
-import { extract, mergeCatalog, fileConfidence, promoteStaged } from '../engine/extract.mjs';
+import {
+  extract,
+  mergeCatalog,
+  fileConfidence,
+  fileRouteTier,
+  partitionSitesByConfidence,
+  promoteStaged,
+} from '../engine/extract.mjs';
 import { rollback } from '../engine/backup.mjs';
+import { parse } from '@babel/parser';
+
+// Parse the emitted source the same way the scanner does — proves a per-site
+// partial extraction produces VALID syntax (a half-rewritten literal would throw).
+function parsesClean(source) {
+  try {
+    parse(source, {
+      sourceType: 'unambiguous',
+      plugins: ['jsx', 'typescript'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function tmpApp() {
   const root = mkdtempSync(join(tmpdir(), 'vl-extract-'));
@@ -303,6 +325,201 @@ describe('fileConfidence — most-cautious aggregation', () => {
   });
   test('empty → low', () => {
     expect(fileConfidence([])).toBe('low');
+  });
+});
+
+// BUG-3 routing primitives. The OLD model (fileConfidence, worst-wins) sank a
+// heavy file by its single worst site; the NEW model (fileRouteTier, best-wins +
+// partition) lets the high sites extract while the low sites stay inline.
+describe('fileRouteTier — highest-tier wins (the BUG-3 inverse of fileConfidence)', () => {
+  test('any high site routes the file high (even with a low sibling)', () => {
+    expect(fileRouteTier([{ confidence: 'high' }, { confidence: 'low' }])).toBe('high');
+  });
+  test('no high but a medium routes medium', () => {
+    expect(fileRouteTier([{ confidence: 'medium' }, { confidence: 'low' }])).toBe('medium');
+  });
+  test('all-low routes low', () => {
+    expect(fileRouteTier([{ confidence: 'low' }, { confidence: 'low' }])).toBe('low');
+  });
+  test('empty → low', () => {
+    expect(fileRouteTier([])).toBe('low');
+  });
+});
+
+describe('partitionSitesByConfidence — bucket sites by tier', () => {
+  test('splits into high/medium/low, unknown confidence defaults to low', () => {
+    const b = partitionSitesByConfidence([
+      { confidence: 'high', line: 1 },
+      { confidence: 'high', line: 2 },
+      { confidence: 'medium', line: 3 },
+      { confidence: 'low', line: 4 },
+      { confidence: undefined, line: 5 },
+    ]);
+    expect(b.high.map((s) => s.line)).toEqual([1, 2]);
+    expect(b.medium.map((s) => s.line)).toEqual([3]);
+    expect(b.low.map((s) => s.line)).toEqual([4, 5]); // undefined → low
+  });
+});
+
+// THE BUG-3 TARGET. A heavy mixed file: 10 clean high jsx-text sites + 1 date-intl
+// (low) + 1 long-interpolated jsx-text (low). The OLD worst-wins routing sank the
+// whole file to inline-only (extracted NOTHING — the 13-heavy-component frontier).
+// The NEW per-site routing extracts the 10 high sites to t(), leaves the 2 low
+// sites inline as literals, parses clean, and is idempotent on re-run.
+const HEAVY_MIXED = `"use client";
+import React from 'react';
+
+export default function Dashboard({ when, name }) {
+  return (
+    <div className="wrap">
+      <h1>Welcome home</h1>
+      <p>Your cosmic dashboard</p>
+      <span>Today at a glance</span>
+      <button>Open settings</button>
+      <a>View your chart</a>
+      <h2>Recent transits</h2>
+      <p>Daily horoscope</p>
+      <span>Moon phase tonight</span>
+      <button>Refresh now</button>
+      <h3>Saved readings</h3>
+      <time>{when.toLocaleDateString(undefined, { month: 'long', day: 'numeric' })}</time>
+      <p>This is a deliberately very long single interpolated narrative line, well past the high-confidence length floor, so the scanner rates it low and the per-site router must leave it inline as a literal rather than wrapping it in a t call {name}</p>
+    </div>
+  );
+}
+`;
+
+describe('BUG-3 — per-SITE routing extracts a heavy mixed file partially', () => {
+  let root;
+  beforeEach(() => {
+    root = tmpApp();
+    write(root, 'src/components/Dashboard.tsx', HEAVY_MIXED);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  test('the 10 high sites extract; the date + long-interpolated low sites stay inline', () => {
+    const inv = scan(root, detect(root));
+
+    // sanity on the fixture: 10 high jsx-text + 1 date-intl(low) + 1 long jsx-text(low).
+    const forFile = inv.sites.filter((s) => s.file === 'src/components/Dashboard.tsx' && !s.excluded);
+    const highs = forFile.filter((s) => s.confidence === 'high');
+    const lows = forFile.filter((s) => s.confidence === 'low');
+    expect(highs).toHaveLength(10);
+    expect(lows).toHaveLength(2); // the date-intl + the long interpolated line
+
+    const report = extract(inv, { appRoot: root });
+    const r = report.results.find((x) => x.file === 'src/components/Dashboard.tsx');
+
+    // the OLD behavior would be route:inline-only, status:inline-only (worst-wins).
+    // the NEW behavior: the file auto-writes its HIGH sites — partial extraction.
+    expect(r.route).toBe('auto-write');
+    expect(r.status).toBe('written');
+    expect(r.sitesWritten).toBe(10);
+    expect(r.sitesInline).toBe(2);
+    expect(r.fullyExtracted).toBe(false); // 2 sites left inline → NOT fully extracted
+
+    const src = readFileSync(join(root, 'src/components/Dashboard.tsx'), 'utf8');
+    // the 10 high sites are now t() calls.
+    expect(src).toContain("const t = useTranslations('Dashboard')");
+    for (const key of [
+      'welcomeHome',
+      'yourCosmicDashboard',
+      'todayAtAGlance',
+      'openSettings',
+      'viewYourChart',
+      'recentTransits',
+      'dailyHoroscope',
+      'moonPhaseTonight',
+      'refreshNow',
+      'savedReadings',
+    ]) {
+      expect(src).toContain(`t('${key}')`);
+    }
+    // the 2 LOW sites stay inline literals — never wrapped.
+    expect(src).toContain('when.toLocaleDateString(undefined,'); // date-intl untouched
+    expect(src).not.toContain('format.dateTime'); // never rewritten to a formatter
+    expect(src).toContain('This is a deliberately very long single interpolated narrative line'); // long line inline
+    // exactly 10 t() call sites land in the catalog.
+    expect(Object.keys(r.keys)).toHaveLength(10);
+  });
+
+  test('the partial output parses clean (no half-rewritten literal)', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root });
+    const src = readFileSync(join(root, 'src/components/Dashboard.tsx'), 'utf8');
+    expect(parsesClean(src)).toBe(true);
+  });
+
+  test('a partial extraction is NOT ratchetable (guard never flips a file that keeps literals)', () => {
+    const inv = scan(root, detect(root));
+    const report = extract(inv, { appRoot: root });
+    // the guard's input list excludes this file — it still holds literals.
+    expect(report.summary.ratchetableFiles).not.toContain('src/components/Dashboard.tsx');
+    expect(report.summary.partial).toBe(1);
+    expect(report.summary.sitesInline).toBe(2);
+    // ledger records the partial state so a resumed run + the guard both know.
+    const ledger = JSON.parse(
+      readFileSync(join(root, '.vibe-lingual/localize/state/extract-ledger.json'), 'utf8'),
+    );
+    expect(ledger.files['src/components/Dashboard.tsx'].fullyExtracted).toBe(false);
+  });
+
+  test('re-running over the now-partial tree writes nothing new (idempotent)', () => {
+    const inv = scan(root, detect(root));
+    const first = extract(inv, { appRoot: root });
+    expect(first.summary.written).toBe(1);
+    expect(first.summary.partial).toBe(1);
+
+    // re-scan the partially-extracted tree + re-run. The 10 high sites are already
+    // t() calls (scan won't re-flag them); only the 2 low sites remain, and they
+    // route inline-only — so zero new writes. Converged.
+    const inv2 = scan(root, detect(root));
+    const second = extract(inv2, { appRoot: root });
+    expect(second.summary.written).toBe(0);
+    const r2 = second.results.find((x) => x.file === 'src/components/Dashboard.tsx');
+    if (r2) {
+      // the file still has its 2 low sites → it routes inline-only now (no high left).
+      expect(['inline-only', 'skipped-done', 'skipped-no-change']).toContain(r2.status);
+    }
+    // source unchanged on the second pass — the high sites stay extracted, low inline.
+    const src = readFileSync(join(root, 'src/components/Dashboard.tsx'), 'utf8');
+    expect(src).toContain("t('welcomeHome')");
+    expect(src).toContain('This is a deliberately very long single interpolated narrative line');
+    expect(parsesClean(src)).toBe(true);
+  });
+
+  test('a fully-high file (no low sites) STILL fully extracts + IS ratchetable (no regression)', () => {
+    // the all-high control: no inline sites → fullyExtracted true → ratchetable.
+    write(root, 'src/components/Clean.tsx', HIGH_CONF_CLIENT.replace('Greeting', 'Clean'));
+    rmSync(join(root, 'src/components/Dashboard.tsx'));
+    const inv = scan(root, detect(root));
+    const report = extract(inv, { appRoot: root });
+    const r = report.results.find((x) => x.file === 'src/components/Clean.tsx');
+    expect(r.status).toBe('written');
+    expect(r.fullyExtracted).toBe(true);
+    expect(r.sitesInline).toBe(0);
+    expect(report.summary.ratchetableFiles).toContain('src/components/Clean.tsx');
+  });
+
+  test('a force-staged heavy file stages its high sites + the partial flag survives promotion', () => {
+    const inv = scan(root, detect(root));
+    const staged = extract(inv, { appRoot: root, stageAll: true });
+    const sr = staged.results.find((x) => x.file === 'src/components/Dashboard.tsx');
+    // force-stage demotes the auto-write to stage but still only the high sites.
+    expect(sr.status).toBe('staged');
+    expect(sr.sitesWritten).toBe(10);
+    expect(sr.sitesInline).toBe(2);
+    expect(sr.fullyExtracted).toBe(false);
+
+    // promote: the partial flag carries, the live source gets the high sites, the
+    // low sites stay inline — a promoted partial is NOT ratchetable.
+    const promoted = promoteStaged(root, 'src/components/Dashboard.tsx');
+    expect(promoted.ok).toBe(true);
+    expect(promoted.fullyExtracted).toBe(false);
+    const live = readFileSync(join(root, 'src/components/Dashboard.tsx'), 'utf8');
+    expect(live).toContain("t('welcomeHome')"); // high extracted
+    expect(live).toContain('when.toLocaleDateString(undefined,'); // date inline
+    expect(parsesClean(live)).toBe(true);
   });
 });
 

@@ -30,16 +30,18 @@ If `inventory.json` or `audit.json` is missing, tell the user to run `/vibe-ling
 | `--apply-staged <file>` | Promote a previously-staged rewrite (the LIVE rel path, e.g. `src/components/Card.tsx`) from the staged mirror to live source, after the user reviewed it. Backed by the engine (`extract … --apply-staged <file>`): backup live (+ its collateral test) → write live → merge the staged catalog into the live catalog → ledger → drop the staged entry. Reversible by batch. |
 | `--phase <name>` | Run a single phase only (`extract` / `wire` / `translate` / `wire-to-locale` / `guard`). Default runs the whole loop. |
 
-## The confidence routing (KTD-2)
+## The confidence routing (KTD-2 + per-SITE routing, BUG-3)
 
-A file's routing confidence is the **most-cautious** of its included sites — one low-confidence site (a long interpolated toast, a date needing the timeZone decision) pulls the whole file to a review path. The codemod still rewrites the high-confidence siblings inside that file; the file is just staged/inline rather than silently auto-written.
+Confidence is routed **per SITE, not per file** (Phase-3 BUG-3). The OLD model routed the whole file by its **most-cautious** site — one low-confidence site (a long interpolated toast, a date needing the timeZone decision) sank a heavy file with dozens of clean high sites to inline-only, extracting NOTHING. The NEW model partitions a file's sites by confidence and routes each tier: the file's HIGH sites extract while only its genuinely-ambiguous (low) sites stay inline. The file's reported `confidence` is still the most-cautious aggregate (banner-honest), but it no longer GATES the whole file — the route is driven by the **highest tier present**.
 
-| File confidence | Route | What happens |
+| Site tier present | File route | What happens |
 |---|---|---|
-| **high** (every site high) | **auto-write** | Backup FIRST → codemod rewrites the live source → namespaced catalog merged (atomic) **into the app's existing layout** (see below). Recorded in the extract ledger for resumability. |
-| **medium** | **stage** | The rewrite + catalog are written to `.vibe-lingual/localize/staged/<file>` for review, and a `staged-manifest.json` entry records the read-back contract (live target, namespace, catalog paths, collateral tests). Live source UNTOUCHED. Promote with `--apply-staged <live-rel-path>` once reviewed. |
-| **low** | **inline-only** | A suggestion surfaced in the banner. No write at all. |
+| **any high site** | **auto-write** | Backup FIRST → codemod rewrites the live source for **the high sites only** → their keys merged into the catalog (atomic) **into the app's existing layout** (see below). Medium/low sites in the same file are left INLINE. Recorded in the extract ledger. |
+| **no high, any medium** | **stage** | The medium sites' rewrite + catalog are written to `.vibe-lingual/localize/staged/<file>` for review; a `staged-manifest.json` entry records the read-back contract. Live source UNTOUCHED. Promote with `--apply-staged <live-rel-path>` once reviewed. Low sites stay inline. |
+| **only low sites** | **inline-only** | A suggestion surfaced in the banner. No write at all. |
 | **blocked** (audit readiness) | **inline-only** | A firebase-admin SSR file or an unhandled dynamic-route glob NEVER auto-writes, regardless of confidence. The block reason is surfaced. |
+
+**Partial extraction is represented honestly.** A file where some sites extracted and some stayed inline reports `fullyExtracted: false`, `sitesWritten`, `sitesInline`, and an `inlineSites[]` list (line/kind/text/confidence per left-behind site). The run summary carries `partial` (count of partially-written files), `sitesInline` (total still-inline frontier), and **`ratchetableFiles`** (the guard's input — only auto-written, FULLY-extracted files).
 
 ## Catalog layout — match what the app already has
 
@@ -110,7 +112,7 @@ Mirror the UI locale → cookie + `router.refresh()`, guarded by a cookie-differ
 
 Emit the two guards:
 - **Parity test** — `node engine/cli.mjs parity <appRoot> --messages <dir>` verifies recursive key-path parity across catalogs (catches BOTH missing AND extra keys). Write the `emitParityTest` output into the app's test suite. This is the single highest-value reusable guard.
-- **jsx-no-literals ratchet** — flip `react/jsx-no-literals` to `error` per **FULLY-extracted file** (it is noisy on partially-extracted files). The guard emitter globs dynamic-route segments with `*` (never the literal `[param]`, which silently never matches) and self-verifies via `eslint --print-config`.
+- **jsx-no-literals ratchet** — flip `react/jsx-no-literals` to `error` per **FULLY-extracted file ONLY**. With per-site routing a written file may be PARTIAL (its low sites are still inline literals) — ratcheting it would turn the build red. Feed the guard emitter **`summary.ratchetableFiles`** (auto-written files with `fullyExtracted === true`), never the raw `written` list. The emitter globs dynamic-route segments with `*` (never the literal `[param]`, which silently never matches) and self-verifies via `eslint --print-config`.
 
 ### 9. Test-harness collateral (engine-driven)
 
@@ -132,11 +134,12 @@ After the loop, run the app's test suite if present — a passing suite is the t
 ═══ Vibe-Lingual localize ═══
 App:        <appRoot>   Adapter: next-intl (App Router)
 
-Extract:    <w> written · <s> staged · <i> inline-only · <b> blocked · <k> keys
+Extract:    <w> written (<p> partial) · <s> staged · <i> inline-only · <b> blocked · <k> keys
+            <si> site(s) left inline (low-confidence frontier — date/interpolated)
 Tests:      <ct> co-located test(s) — <cw> provider-wrapped, <cm> need a manual wrap
 Wired:      request.ts · locale-cookie.ts · provider · next.config · jest ESM patch
 Catalogs:   messages/en/*.json (source) · <N> locale(s) drafted, <M> marked untranslated
-Guard:      parity test emitted · jsx-no-literals ratcheted on <g> file(s)
+Guard:      parity test emitted · jsx-no-literals ratcheted on <g> fully-extracted file(s)
 
 Backup batch: <batchId>   (rollback: /vibe-lingual:localize --rollback <batchId>)
 Staged:       <staged-count> file(s) in .vibe-lingual/localize/staged/ — review then

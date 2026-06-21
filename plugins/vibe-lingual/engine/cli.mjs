@@ -325,9 +325,11 @@ function runExtract(argv) {
   const s = report.summary;
   console.error(
     `vibe-lingual extract${report.dryRun ? ' (dry-run)' : ''}: ${s.files} file(s) — ` +
-      `${s.written} written · ${s.staged} staged · ${s.inlineOnly} inline-only · ` +
+      `${s.written} written${s.partial ? ` (${s.partial} partial)` : ''} · ${s.staged} staged · ` +
+      `${s.inlineOnly} inline-only · ` +
       `${s.blocked} blocked · ${s.skippedDone + s.skippedNoChange} skipped · ` +
-      `${s.keysWritten} key(s) written.` +
+      `${s.keysWritten} key(s) written` +
+      (s.sitesInline ? ` · ${s.sitesInline} site(s) left inline.` : '.') +
       (s.collateralTests
         ? ` ${s.collateralTests} co-located test(s): ${s.collateralTestsWrapped} wrapped` +
           (s.collateralTestsNeedManualWrap ? `, ${s.collateralTestsNeedManualWrap} need a manual wrap` : '') +

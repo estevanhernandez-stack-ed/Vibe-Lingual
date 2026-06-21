@@ -217,8 +217,21 @@ export default function transformer(fileInfo, api, options = {}) {
 const SRC_OPTS = { quote: 'single', trailingComma: true, tabWidth: 2 };
 
 // Programmatic entry — the SKILL drives this directly (no CLI spawn).
-//   transform(source, { path, isClient, namespace }) ->
+//   transform(source, { path, isClient, namespace, sites, skipSites }) ->
 //     { code, changed, keys, namespace, hooksAdded }
+//
+// PER-SITE FILTER (Phase-3 BUG-3). `sites` / `skipSites` let a caller rewrite ONLY
+// a chosen subset of a file's eligible literals, leaving the rest as inline
+// literals — the mechanism that lets a heavy mixed file extract its clean
+// high-confidence sites while its genuinely-ambiguous (low-confidence, structural)
+// sites stay inline. Each entry is a position descriptor `{ line, text?, kind? }`:
+//   - `sites`     — an ALLOW list: rewrite a literal ONLY if it matches an entry.
+//   - `skipSites` — a DENY list: rewrite every eligible literal EXCEPT matches.
+// A site MATCHES an entry when their lines agree AND (for text/attribute kinds)
+// the trimmed text agrees; a date-intl entry matches by line alone (the scan
+// emits a synthetic label for date sites, not the source text). When NEITHER
+// option is supplied the codemod preserves its current whole-file behavior (every
+// eligible site is rewritten) so every existing test passes unchanged.
 export function transform(source, options = {}) {
   const j = jHelper;
   const root = j(source);
@@ -233,12 +246,59 @@ export function transform(source, options = {}) {
   };
 }
 
-// Build the per-file transform context: namespace, server/client mode, and the
-// catalog accumulator. Mode detection: an explicit options.isClient wins;
-// otherwise decideIsClient() classifies by client signals (directive OR
-// client-only hook OR event handler), falling back to server only for an
-// already-async, signal-free component. The context is threaded through every
-// rewrite.
+// Normalize a list of position descriptors into a lookup index. Two buckets:
+//   byLineText — Set of `"<line> <trimmedText>"` for text/attribute sites.
+//   byLine     — Set of line numbers for date-intl (and any text-less) entries.
+// A text-bearing entry indexes under BOTH (so a date entry that also carries text
+// still matches by line; a text entry still matches by line+text). Returns null
+// for an absent/empty list so callers can cheaply skip filtering.
+function buildSiteIndex(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const byLineText = new Set();
+  const byLine = new Set();
+  for (const s of list) {
+    if (!s || typeof s.line !== 'number') continue;
+    byLine.add(s.line);
+    if (s.kind !== 'date-intl' && typeof s.text === 'string' && s.text.trim()) {
+      byLineText.add(`${s.line} ${s.text.trim()}`);
+    }
+  }
+  return { byLineText, byLine };
+}
+
+// Does a (line, text, isDate) site match an index? Text/attribute sites need a
+// line+text hit (falling back to a bare line hit only when the index holds no
+// text key for that line — tolerant of a caller that supplied lines only). Date
+// sites match on line alone.
+function siteIndexMatches(index, line, text, isDate) {
+  if (!index) return false;
+  if (typeof line !== 'number') return false;
+  if (isDate) return index.byLine.has(line);
+  const trimmed = typeof text === 'string' ? text.trim() : '';
+  if (trimmed && index.byLineText.has(`${line} ${trimmed}`)) return true;
+  // a line-only entry (no text recorded for this line) still matches by line.
+  if (!index.byLineText.has(`${line} ${trimmed}`) && index.byLine.has(line)) {
+    // only honor the bare-line match when NO text key exists for that line — an
+    // index that DID record text for the line is asserting a specific literal, so
+    // a different literal sharing the line must not slip through.
+    let lineHasTextKey = false;
+    for (const k of index.byLineText) {
+      if (k.startsWith(`${line} `)) {
+        lineHasTextKey = true;
+        break;
+      }
+    }
+    if (!lineHasTextKey) return true;
+  }
+  return false;
+}
+
+// Build the per-file transform context: namespace, server/client mode, the
+// catalog accumulator, and the optional per-site allow/deny filter (BUG-3).
+// Mode detection: an explicit options.isClient wins; otherwise decideIsClient()
+// classifies by client signals (directive OR client-only hook OR event handler),
+// falling back to server only for an already-async, signal-free component. The
+// context is threaded through every rewrite.
 function buildContext(path, options) {
   const namespace = options.namespace || deriveNamespace(path);
   return {
@@ -246,7 +306,22 @@ function buildContext(path, options) {
     namespace,
     isClientExplicit: typeof options.isClient === 'boolean' ? options.isClient : null,
     keys: {}, // key -> source text, the namespaced catalog fragment for this file
+    // allow/deny site indices (null when not filtering — whole-file behavior).
+    allowSites: buildSiteIndex(options.sites),
+    skipSites: buildSiteIndex(options.skipSites),
   };
+}
+
+// The per-site gate (BUG-3). Returns true when a literal at `line` carrying `text`
+// (date sites pass isDate=true) is ELIGIBLE for rewrite under the active filter:
+//   - an `allowSites` index present → rewrite ONLY when it matches.
+//   - a `skipSites` index present → rewrite UNLESS it matches.
+//   - neither → rewrite (whole-file default; preserves pre-BUG-3 behavior).
+// allowSites takes precedence when both are somehow supplied.
+function siteAllowed(ctx, line, text, isDate) {
+  if (ctx.allowSites) return siteIndexMatches(ctx.allowSites, line, text, isDate);
+  if (ctx.skipSites) return !siteIndexMatches(ctx.skipSites, line, text, isDate);
+  return true;
 }
 
 // React client-only hooks: a component calling ANY of these (or any custom
@@ -415,6 +490,7 @@ function runCodemod(j, root, ctx) {
     if (isInsideTranslationCall(j, p)) return; // idempotency
     if (!isReachableFromComponentBody(p, componentBody)) return; // BUG-2: t out of scope
     const text = raw.trim();
+    if (!siteAllowed(ctx, nodeLine(p.node), text, false)) return; // BUG-3: per-site filter
     const key = registerKey(ctx, text);
     // Preserve surrounding whitespace: a JSX text node may carry leading/trailing
     // whitespace that is structurally meaningful (spacing between inline elements).
@@ -448,6 +524,7 @@ function runCodemod(j, root, ctx) {
     if (lit == null) return;
     if (!isUserFacingText(lit, ATTR_KIND[lower])) return;
     if (!isReachableFromComponentBody(p, componentBody)) return; // BUG-2: t out of scope
+    if (!siteAllowed(ctx, nodeLine(p.node), lit, false)) return; // BUG-3: per-site filter
     const key = registerKey(ctx, lit);
     p.node.value = j.jsxExpressionContainer(tCall(j, key));
     textChanged = true;
@@ -464,6 +541,10 @@ function runCodemod(j, root, ctx) {
       // a closure defined OUTSIDE the body (module-scope `dynamic` options) can't
       // reach it — leave such sites inline.
       if (!isReachableFromComponentBody(site.path, componentBody)) continue;
+      // BUG-3: per-site filter — a date site not in the allow-set (or in the
+      // skip-set) stays inline. Date sites are nearly always low confidence, so
+      // a per-site run typically routes them inline.
+      if (!siteAllowed(ctx, nodeLine(site.path.node), null, true)) continue;
       rewriteDateSite(j, site);
       dateChanged = true;
     }
@@ -510,6 +591,13 @@ function registerKey(ctx, text) {
 // Build a `t('key')` call expression.
 function tCall(j, key) {
   return j.callExpression(j.identifier('t'), [j.stringLiteral(key)]);
+}
+
+// 1-based source line of a node (for the BUG-3 per-site filter, which keys on the
+// scan inventory's `line`). 0 when location is unavailable (an unmatchable line —
+// safe: an allow-list won't match it, a skip-list won't exclude it).
+function nodeLine(node) {
+  return node && node.loc && node.loc.start ? node.loc.start.line : 0;
 }
 
 // pull a plain string out of a JSXAttribute value (StringLiteral, or a

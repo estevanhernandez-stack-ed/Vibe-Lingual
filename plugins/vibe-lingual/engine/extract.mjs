@@ -61,12 +61,21 @@ const DEFAULT_MESSAGES_DIR = 'messages';
 const DEFAULT_SOURCE_LOCALE = 'en';
 
 // ---------------------------------------------------------------------------
-// confidence aggregation — a FILE's routing confidence is the most-cautious of
-// its included sites. One low-confidence site in a file (a long interpolated
-// toast, a date that needs the timeZone decision) pulls the whole file down to a
-// review path: the codemod still rewrites the high-confidence siblings, but the
-// file is staged/inline rather than silently auto-written. Conservative by
-// construction — auto-write is reserved for files where EVERY site is high.
+// confidence — reported per FILE (the most-cautious of its sites, for the banner)
+// AND routed per SITE (Phase-3 BUG-3). The OLD model routed the whole file by its
+// worst site: one low-confidence site (a long interpolated toast, a date needing
+// the timeZone decision) sank a heavy file with dozens of clean high sites to
+// inline-only — extracting NOTHING. The NEW model partitions a file's sites by
+// confidence and routes each TIER:
+//   HIGH   sites → auto-write (rewrite them, merge their keys, back up first).
+//   MEDIUM sites → the review path (stage the rewrite for human review).
+//   LOW    sites → inline-only — a suggestion, never auto-written.
+// A file's ROUTE is its highest tier present: any high → auto-write its high
+// sites; else any medium → stage its medium sites; else inline-only. The sites
+// NOT in the write-set for that route stay INLINE as literals — so a heavy mixed
+// file extracts its clean sites while its genuinely-ambiguous sites are left
+// alone. `fileConfidence` (the most-cautious aggregate) is still REPORTED so the
+// banner reads honestly, but it no longer GATES the whole file.
 // ---------------------------------------------------------------------------
 
 const CONF_RANK = { low: 0, medium: 1, high: 2 };
@@ -78,6 +87,30 @@ export function fileConfidence(sitesForFile) {
     if (CONF_RANK[s.confidence] < CONF_RANK[worst]) worst = s.confidence;
   }
   return worst;
+}
+
+// The HIGHEST tier present in a file's sites — the tier the file's route is
+// derived from. Any high site → 'high' (auto-write); else any medium → 'medium'
+// (stage); else 'low' (inline-only). The inverse of fileConfidence's worst-wins.
+export function fileRouteTier(sitesForFile) {
+  if (!sitesForFile || sitesForFile.length === 0) return 'low';
+  let best = 'low';
+  for (const s of sitesForFile) {
+    if (CONF_RANK[s.confidence] > CONF_RANK[best]) best = s.confidence;
+  }
+  return best;
+}
+
+// Partition a file's sites into { high, medium, low } buckets by confidence.
+// Sites with an unknown confidence default to low (conservative — never
+// auto-written on a missing/garbled confidence value).
+export function partitionSitesByConfidence(sitesForFile) {
+  const buckets = { high: [], medium: [], low: [] };
+  for (const s of sitesForFile || []) {
+    const c = s && (s.confidence === 'high' || s.confidence === 'medium') ? s.confidence : 'low';
+    buckets[c].push(s);
+  }
+  return buckets;
 }
 
 const ROUTE_BY_CONFIDENCE = { high: 'auto-write', medium: 'stage', low: 'inline-only' };
@@ -657,13 +690,28 @@ export function extract(inventory, options = {}) {
   );
 
   for (const [file, sites] of files) {
+    // REPORTED confidence — the most-cautious aggregate (banner-honest). The
+    // ROUTE is now driven by the HIGHEST tier present (BUG-3 per-site routing):
+    // a heavy file with even one high site auto-writes its high sites instead of
+    // being sunk to inline-only by its worst site.
     const confidence = fileConfidence(sites);
-    let route = ROUTE_BY_CONFIDENCE[confidence];
+    const routeTier = fileRouteTier(sites);
+    const buckets = partitionSitesByConfidence(sites);
+    let route = ROUTE_BY_CONFIDENCE[routeTier];
     // FORCE-STAGE (--stage-all): the conservative first pass routes every file
     // that would auto-write to STAGE instead. A low-confidence file stays
     // inline-only (force-stage never PROMOTES a route, only demotes auto-write).
     // The audit's blocked gate below still wins over this.
     if (stageAll && route === 'auto-write') route = 'stage';
+    // The WRITE-SET for this route — which sites the codemod is allowed to rewrite
+    // this run. auto-write/stage rewrites the route's tier; the OTHER sites stay
+    // INLINE as literals (a partially-extracted file). For auto-write the tier is
+    // high; for a (force-)staged high file the tier is still high (it just stages);
+    // for a stage-by-medium file the tier is medium. Low sites are never in a
+    // write-set — they are the inline suggestions.
+    const writeTier = route === 'inline-only' ? null : routeTier;
+    const writeSet = writeTier ? buckets[writeTier] : [];
+    const inlineSites = sites.filter((s) => !writeSet.includes(s));
     const r = ready.get(file);
 
     // blocked files (firebase-admin SSR / unhandled dynamic-route glob) are NEVER
@@ -732,9 +780,16 @@ export function extract(inventory, options = {}) {
     }
 
     const isClient = isClientFile(appRoot, file);
+    // PER-SITE FILTER (BUG-3): when some of this file's sites are routed inline
+    // (a partial extraction), constrain the codemod to ONLY the write-set so the
+    // inline sites are left as literals. When the write-set is the whole file
+    // (every site shares the route's tier), pass NO filter — preserving the exact
+    // whole-file codemod behavior (and byte-for-byte idempotency).
+    const partial = inlineSites.length > 0 && writeSet.length > 0;
     const out = transform(source, {
       path: file,
       ...(isClient != null ? { isClient } : {}),
+      ...(partial ? { sites: writeSet } : {}),
     });
 
     // codemod found nothing to rewrite → idempotent no-op (already extracted, or
@@ -777,6 +832,28 @@ export function extract(inventory, options = {}) {
     // recorded for the promotion step; on inline-only they are just surfaced.
     const collateralTests = findCollateralTests(appRoot, file);
 
+    // PARTIAL-EXTRACTION accounting (BUG-3). When a file's write-set is a strict
+    // subset of its sites, the file is PARTIALLY extracted: the write-set's sites
+    // became t() calls, the rest stay inline literals. `fullyExtracted` is the
+    // guard gate — only a file with ZERO inline sites left may be ratcheted to
+    // jsx-no-literals:error (a partial file keeps literals → ratcheting it would
+    // turn the build red). sitesWritten/sitesInline make the run-report honest.
+    const sitesInlineMeta = inlineSites.map((s) => ({
+      line: s.line,
+      kind: s.kind,
+      text: s.text,
+      confidence: s.confidence,
+    }));
+    // A file is fully extracted (eligible to ratchet) only when EVERY one of its
+    // inventoried sites was in this run's write-set AND the route actually rewrote
+    // the live source (status 'written'). Stage/inline never count as fully
+    // extracted live — the live source still holds the literals.
+    const isFullExtraction = inlineSites.length === 0;
+    const partialNote =
+      inlineSites.length > 0
+        ? ` (partial — ${writeSet.length} site(s) extracted, ${inlineSites.length} left inline)`
+        : '';
+
     // ---- route: inline-only (low) — suggest, write nothing. ----
     if (route === 'inline-only') {
       results.push({
@@ -791,6 +868,15 @@ export function extract(inventory, options = {}) {
         catalogLayout,
         backupPath: null,
         collateralTests,
+        fullyExtracted: false,
+        sitesWritten: 0,
+        sitesInline: sites.length,
+        inlineSites: sites.map((s) => ({
+          line: s.line,
+          kind: s.kind,
+          text: s.text,
+          confidence: s.confidence,
+        })),
       });
       continue;
     }
@@ -838,6 +924,10 @@ export function extract(inventory, options = {}) {
           sourceLocale,
           confidence,
           collateralTests,
+          // partial-extraction carries to promotion: a promoted partial file still
+          // holds inline literals → NOT ratchetable. Recorded so promoteStaged
+          // reports it honestly and the guard never ratchets a partial promotion.
+          fullyExtracted: isFullExtraction,
           stagedAt: new Date().toISOString(),
         };
         stagedTouched = true;
@@ -847,9 +937,10 @@ export function extract(inventory, options = {}) {
         route,
         confidence,
         status: 'staged',
-        reason: stageAll && confidence === 'high'
-          ? 'force-staged (--stage-all) — rewrite + catalog staged for review (live source untouched)'
-          : 'medium file confidence — rewrite + catalog staged for review (live source untouched)',
+        reason:
+          (stageAll && routeTier === 'high'
+            ? 'force-staged (--stage-all) — rewrite + catalog staged for review (live source untouched)'
+            : 'medium-tier sites staged for review (live source untouched)') + partialNote,
         changed: true,
         keys: out.keys,
         namespace,
@@ -857,6 +948,12 @@ export function extract(inventory, options = {}) {
         stagedSource: relStagedSource,
         backupPath: null,
         collateralTests,
+        // a staged file is not LIVE-extracted yet; fullyExtracted reflects whether
+        // the staged rewrite (once promoted) would be a full extraction.
+        fullyExtracted: isFullExtraction,
+        sitesWritten: writeSet.length,
+        sitesInline: inlineSites.length,
+        inlineSites: sitesInlineMeta,
       });
       continue;
     }
@@ -920,6 +1017,10 @@ export function extract(inventory, options = {}) {
         catalogCreated: !catalogExistedBefore,
         backupPath,
         collateralTests,
+        // a partially-extracted file still holds inline literals; the guard must
+        // NOT ratchet it. Recorded so a resumed run + the guard step both know.
+        fullyExtracted: isFullExtraction,
+        sitesInline: inlineSites.length,
         batchId: batch.batchId,
         at: new Date().toISOString(),
       };
@@ -930,8 +1031,8 @@ export function extract(inventory, options = {}) {
       confidence,
       status: dryRun ? 'inline-only' : 'written',
       reason: dryRun
-        ? 'dry-run: would auto-write (high confidence)'
-        : 'high file confidence — source rewritten + catalog merged (backed up)',
+        ? `dry-run: would auto-write (high-tier sites)${partialNote}`
+        : `high-tier sites rewritten + catalog merged (backed up)${partialNote}`,
       changed: true,
       keys: out.keys,
       namespace,
@@ -941,6 +1042,13 @@ export function extract(inventory, options = {}) {
       backupPath,
       collateralTests,
       testEdits,
+      // PARTIAL-EXTRACTION (BUG-3): fullyExtracted gates the jsx-no-literals
+      // ratchet (only a file with zero inline sites is safe to ratchet); the
+      // site counts + inlineSites[] make a partial extraction legible.
+      fullyExtracted: isFullExtraction,
+      sitesWritten: writeSet.length,
+      sitesInline: inlineSites.length,
+      inlineSites: sitesInlineMeta,
     });
   }
 
@@ -968,6 +1076,16 @@ export function extract(inventory, options = {}) {
     keysWritten: results
       .filter((x) => x.status === 'written')
       .reduce((n, x) => n + Object.keys(x.keys || {}).length, 0),
+    // PARTIAL-EXTRACTION accounting (BUG-3). A written file is PARTIAL when it left
+    // sites inline; `partial` counts those. `sitesInline` sums every inline site
+    // across the run (the still-to-do frontier). `ratchetableFiles` is the guard's
+    // input: ONLY auto-WRITTEN, FULLY-extracted files (zero inline sites) — a
+    // partial file keeps literals and ratcheting it would turn the build red.
+    partial: results.filter((x) => x.status === 'written' && x.fullyExtracted === false).length,
+    sitesInline: results.reduce((n, x) => n + (typeof x.sitesInline === 'number' ? x.sitesInline : 0), 0),
+    ratchetableFiles: results
+      .filter((x) => x.status === 'written' && x.fullyExtracted === true)
+      .map((x) => x.file),
     // collateral-test accounting — how many co-located tests were touched, and how
     // many auto-wrapped vs need a manual wrap. Surfaced so the SKILL can warn before
     // the suite goes red, and so rollback coverage is auditable.
@@ -1132,6 +1250,11 @@ export function promoteStaged(appRoot, file, options = {}) {
   });
   if (!liveCatalogExistedBefore) batch.recordCreatedCatalog(entry.liveCatalog);
 
+  // a promoted PARTIAL staged rewrite still holds inline literals in the live
+  // source → not ratchetable. Default to true for older manifests that predate the
+  // flag (their staged rewrites were whole-file, hence full).
+  const promotedFullyExtracted = entry.fullyExtracted !== false;
+
   ledger.files[key] = {
     status: 'written',
     confidence: entry.confidence,
@@ -1142,6 +1265,7 @@ export function promoteStaged(appRoot, file, options = {}) {
     catalogCreated: !liveCatalogExistedBefore,
     backupPath,
     collateralTests,
+    fullyExtracted: promotedFullyExtracted,
     batchId: batch.batchId,
     promotedFromStaged: true,
     at: new Date().toISOString(),
@@ -1172,6 +1296,8 @@ export function promoteStaged(appRoot, file, options = {}) {
     namespace: entry.namespace,
     keysMerged: { added: merge.added, kept: merge.kept, total: merge.total },
     testEdits,
+    // gates the guard ratchet on a promoted file, same as the auto-write path.
+    fullyExtracted: promotedFullyExtracted,
   };
 }
 
