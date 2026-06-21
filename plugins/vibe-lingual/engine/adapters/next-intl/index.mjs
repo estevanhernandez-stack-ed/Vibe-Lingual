@@ -1,11 +1,14 @@
 // next-intl adapter — v1 deep adapter (App Router, cookie-driven locale).
 //
-// M6 SCOPE: `matches()` + `id` + `capabilities` are real (M5), and wire() is now
-// the deep, cowpath-modeled implementation (delegated to ./wire.mjs). The
-// remaining mutating methods — transform / emitParityTest / emitGuard (M7) — are
-// clearly-marked TODO and MUST NOT be implemented here. They throw a marked
-// "not yet implemented" error if called before M7 lands, so an accidental early
-// call fails loudly instead of silently no-op'ing.
+// M7 SCOPE: the adapter is now FULLY implemented. `matches()` + `id` +
+// `capabilities` (M5), wire() (M6), and the mutating core — transform /
+// emitParityTest / emitGuard (M7) — are all real, modeled byte-for-byte on the
+// proven Celestia3 cowpath:
+//   - transform   → ./transform.mjs (jscodeshift codemod, server/client-aware,
+//                   literal → t()/getTranslations/useFormatter, per-call tz)
+//   - emitParityTest → ../../parity.mjs (recursive key-path parity test)
+//   - emitGuard   → ./guard.mjs (jsx-no-literals override, '*'-globbed dynamic
+//                   routes, eslint --print-config self-verify)
 //
 // What this adapter claims (the cowpath truth from Celestia3):
 //   next-intl is the App-Router-native i18n choice. It claims any Next.js App
@@ -16,8 +19,9 @@
 //   even if a next-intl dependency happens to be installed.
 
 import { wire as wireNextIntl } from './wire.mjs';
-
-const TODO_M7 = "vibe-lingual: next-intl transform lands in M7 — not yet implemented";
+import transformer, { transform as transformSource } from './transform.mjs';
+import { emitGuard, verifyGuard } from './guard.mjs';
+import { emitParityTest } from '../../parity.mjs';
 
 // A frameworks-this-adapter-can-claim set: next-intl proper, or 'none' (no i18n
 // lib yet) — both are valid when the router is App Router. A DIFFERENT installed
@@ -48,22 +52,32 @@ export const nextIntlAdapter = {
     return wireNextIntl(ctx);
   },
 
-  // TODO(M7): jscodeshift codemod literal → t()/getTranslations/useFormatter,
-  // server/client-aware, attribute kinds too. A function placeholder for now so
-  // the `transform` property is the right TYPE (a callable transform module).
-  transform(/* fileInfo, api, options */) {
-    throw new Error(TODO_M7);
+  // The jscodeshift codemod: literal → t()/getTranslations/useFormatter,
+  // server/client-aware, jsx-text + attribute kinds, per-call runtime timeZone on
+  // date sites, structural-Intl left untouched, idempotent. This IS the
+  // jscodeshift transform (fileInfo, api, options). A programmatic entry that
+  // takes raw source is exposed as `transformSource` for the SKILL.
+  transform: transformer,
+  transformSource,
+
+  // Emit the recursive key-path parity test for the given locales (delegates to
+  // the framework-agnostic engine/parity.mjs — the test shape is identical across
+  // frameworks; only the import path differs, which the SKILL supplies).
+  emitParityTest(locales, options = {}) {
+    return emitParityTest(locales, options);
   },
 
-  // TODO(M7): emit the recursive key-path parity test for the given locales.
-  emitParityTest(/* locales */) {
-    throw new Error(TODO_M7);
+  // Emit the react/jsx-no-literals override for the fully-extracted files,
+  // dynamic-route segments globbed with '*' (never the literal '[param]'), and
+  // self-verify via `eslint --print-config` against the target app's eslint.
+  emitGuard(files, options = {}) {
+    return emitGuard(files, options);
   },
 
-  // TODO(M7): emit the react/jsx-no-literals override, dynamic routes globbed
-  // with '*', self-verified via `eslint --print-config`.
-  emitGuard(/* files */) {
-    throw new Error(TODO_M7);
+  // Self-verifying guard: emit + run `eslint --print-config` per file (degrades to
+  // a structural verdict when eslint is not resolvable in the app).
+  verifyGuard(files, options = {}) {
+    return verifyGuard(files, options);
   },
 
   // Capabilities are real now (the SKILL reads these to gate prompts): next-intl

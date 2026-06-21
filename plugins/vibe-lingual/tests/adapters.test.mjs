@@ -163,7 +163,7 @@ describe('stubs — declared but inert (no mutation surface)', () => {
   });
 });
 
-describe('next-intl adapter — wire() implemented (M6); transform et al TODO (M7)', () => {
+describe('next-intl adapter — FULLY implemented (wire M6; transform/parity/guard M7)', () => {
   test('wire() is implemented — returns a WiredFileSet, does not throw', () => {
     const set = nextIntlAdapter.wire({});
     expect(set).toMatchObject({
@@ -175,10 +175,29 @@ describe('next-intl adapter — wire() implemented (M6); transform et al TODO (M
     expect(set.patches.length).toBeGreaterThan(0);
   });
 
-  test('transform / emitParityTest / emitGuard throw the M7 marker', () => {
-    expect(() => nextIntlAdapter.transform({})).toThrow(/M7/);
-    expect(() => nextIntlAdapter.emitParityTest(['en'])).toThrow(/M7/);
-    expect(() => nextIntlAdapter.emitGuard([])).toThrow(/M7/);
+  test('transform is the jscodeshift codemod (a callable, not a throwing stub)', () => {
+    expect(typeof nextIntlAdapter.transform).toBe('function');
+    // a programmatic source entry is exposed for the SKILL.
+    expect(typeof nextIntlAdapter.transformSource).toBe('function');
+    const out = nextIntlAdapter.transformSource(
+      '"use client";\nexport default function C(){ return <p>Hello world</p>; }',
+      { path: 'src/components/C.tsx' },
+    );
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("useTranslations('C')");
+  });
+
+  test('emitParityTest returns a parity-test File for the given locales', () => {
+    const file = nextIntlAdapter.emitParityTest(['en', 'es', 'ja']);
+    expect(file.path).toMatch(/catalog-parity\.test\.ts$/);
+    expect(file.contents).toContain("import en from");
+    expect(file.contents).toContain('describe(\'catalog parity\'');
+  });
+
+  test('emitGuard returns an EslintOverride with globbed dynamic routes', () => {
+    const override = nextIntlAdapter.emitGuard(['src/app/s/[shareId]/page.tsx']);
+    expect(override.files).toEqual(['src/app/s/*/page.tsx']);
+    expect(override.rules['react/jsx-no-literals'][0]).toBe('error');
   });
 
   test('matches() is a pure predicate — true for App Router, false for Pages', () => {
