@@ -1,0 +1,364 @@
+// M2 — scan + six-block brief tests.
+//
+// Asserts the scanner's classification on a fixture app tree carrying the four
+// required cases from docs/checklist.md M2:
+//   (i)   a structural-Intl site that must NOT be auto-included (excluded flag),
+//   (ii)  CSS-className / data-attr / test-id strings that must NOT be extracted,
+//   (iii) all four attribute kinds (placeholder / aria-label / title / alt),
+//   (iv)  a toast/error literal.
+// Plus the regression-oracle guard (an already-`t()`-wrapped string is not re-flagged),
+// the inventory-schema validation, and the six-block brief emission.
+
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { detect } from '../engine/detect.mjs';
+import { scan } from '../engine/scan.mjs';
+import { brief } from '../engine/brief.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const APP = join(__dirname, 'fixtures', 'scan-app');
+
+const inventory = scan(APP, detect(APP));
+const sites = inventory.sites;
+const included = sites.filter((s) => !s.excluded);
+
+const at = (kind) => sites.filter((s) => s.kind === kind);
+const textsOf = (kind) => at(kind).map((s) => s.text);
+const fileSites = (substr) => sites.filter((s) => s.file.includes(substr));
+
+// ---------------------------------------------------------------------------
+// (i) structural-Intl must NOT be auto-included
+// ---------------------------------------------------------------------------
+describe('scan — (i) structural Intl is flagged, not included', () => {
+  const intl = at('date-intl');
+
+  test('the birthDateTime.ts tz-math sites are both flagged structuralIntl + excluded', () => {
+    const structural = intl.filter((s) => s.file.includes('birthDateTime'));
+    expect(structural.length).toBe(2);
+    for (const s of structural) {
+      expect(s.structuralIntl).toBe(true);
+      expect(s.excluded).toBe(true);
+      expect(typeof s.excludedReason).toBe('string');
+    }
+  });
+
+  test('structural sites carry low confidence (never silently extracted)', () => {
+    for (const s of intl.filter((s) => s.excluded)) {
+      expect(s.confidence).toBe('low');
+    }
+  });
+
+  test('a PRESENTATIONAL date in a component is included (not excluded) at low confidence', () => {
+    const presentational = intl.find((s) => s.file.includes('Notices'));
+    expect(presentational).toBeDefined();
+    expect(presentational.structuralIntl).toBe(false);
+    expect(presentational.excluded).toBeUndefined();
+    expect(presentational.confidence).toBe('low');
+  });
+
+  test('excluded structural sites do not inflate component density', () => {
+    const birthRow = inventory.componentsByDensity.find((c) => c.file.includes('birthDateTime'));
+    expect(birthRow).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (ii) CSS-className / data-attr / test-id false positives must NOT be extracted
+// ---------------------------------------------------------------------------
+describe('scan — (ii) machinery strings are NOT treated as user-facing', () => {
+  const allText = sites.map((s) => s.text);
+
+  test('no tailwind/className token string is extracted', () => {
+    expect(allText).not.toContain('w-full bg-black/50 border border-white/10 rounded-xl px-4 py-3');
+    expect(allText).not.toContain('flex items-center gap-3');
+    expect(allText).not.toContain('text-lg font-bold');
+    expect(allText).not.toContain('sr-only');
+    expect(allText).not.toContain('rounded-full');
+  });
+
+  test('no data-testid / data-cy / id / htmlFor / role value is extracted', () => {
+    expect(allText).not.toContain('profile-card'); // data-testid
+    expect(allText).not.toContain('search-box'); // data-cy
+    expect(allText).not.toContain('profile-root'); // id
+    expect(allText).not.toContain('search-input'); // id + htmlFor
+    expect(allText).not.toContain('region'); // role
+  });
+
+  test('the className held in a const (CARD_CLASS) is not picked up as a string site', () => {
+    expect(allText).not.toContain('w-full bg-black/50 border border-white/10 rounded-xl px-4 py-3');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (iii) attribute kinds — placeholder / aria-label / title / alt
+// ---------------------------------------------------------------------------
+describe('scan — (iii) attribute kinds are detected by the scanner (not ESLint)', () => {
+  test('placeholder is captured', () => {
+    expect(textsOf('placeholder')).toContain('Search your readings');
+  });
+
+  test('aria-label is captured', () => {
+    expect(textsOf('aria-label')).toEqual(
+      expect.arrayContaining(['Search readings input', 'Settings']),
+    );
+  });
+
+  test('title is captured', () => {
+    expect(textsOf('title')).toContain('Open settings panel');
+  });
+
+  test('alt is captured', () => {
+    expect(textsOf('alt')).toContain('User profile avatar');
+  });
+
+  test('each attribute kind has the right `kind` tag', () => {
+    expect(at('placeholder').every((s) => s.kind === 'placeholder')).toBe(true);
+    expect(at('aria-label').every((s) => s.kind === 'aria-label')).toBe(true);
+    expect(at('title').every((s) => s.kind === 'title')).toBe(true);
+    expect(at('alt').every((s) => s.kind === 'alt')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (iv) toast / error literals
+// ---------------------------------------------------------------------------
+describe('scan — (iv) toast / error literals are captured as kind=toast', () => {
+  const toasts = textsOf('toast');
+
+  test('toast.success / toast.error string args are captured', () => {
+    expect(toasts).toEqual(
+      expect.arrayContaining(['Profile saved successfully', 'Could not save your profile']),
+    );
+  });
+
+  test('a new Error(...) message literal is captured', () => {
+    expect(toasts).toContain('Profile save failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// regression oracle — an already-extracted t()-wrapped literal is NOT re-flagged
+// ---------------------------------------------------------------------------
+describe('scan — regression oracle: already-extracted strings are not re-flagged', () => {
+  test('the t() key argument is never emitted as a jsx-text or any site', () => {
+    const allText = sites.map((s) => s.text);
+    expect(allText).not.toContain('alreadyExtractedLabel');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// real copy IS captured (jsx-text positive control)
+// ---------------------------------------------------------------------------
+describe('scan — jsx-text copy is captured', () => {
+  test('multi-word visible copy is extracted', () => {
+    const jt = textsOf('jsx-text');
+    expect(jt).toEqual(
+      expect.arrayContaining([
+        'Welcome back, traveler',
+        'Your reading is ready to view.',
+        'Reading not found',
+        'Shared reading',
+      ]),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// suggested namespace / key / confidence + density ranking
+// ---------------------------------------------------------------------------
+describe('scan — suggested namespace + key + confidence + density', () => {
+  test('namespace follows the component basename (PascalCase)', () => {
+    const profile = fileSites('ProfileCard').filter((s) => !s.excluded);
+    expect(profile.length).toBeGreaterThan(0);
+    expect(profile.every((s) => s.suggestedNamespace === 'ProfileCard')).toBe(true);
+  });
+
+  test('a route page takes its parent dir as namespace (never the [param] dir)', () => {
+    const page = fileSites('[shareId]');
+    expect(page.length).toBeGreaterThan(0);
+    for (const s of page) {
+      expect(s.suggestedNamespace).not.toMatch(/[[\]]/);
+    }
+  });
+
+  test('lib/util file date sites fall back to the common namespace', () => {
+    const birth = fileSites('birthDateTime');
+    expect(birth.every((s) => s.suggestedNamespace === 'common')).toBe(true);
+  });
+
+  test('suggested keys are camelCase slugs of the copy', () => {
+    const s = at('jsx-text').find((x) => x.text === 'Welcome back, traveler');
+    expect(s.suggestedKey).toBe('welcomeBackTraveler');
+  });
+
+  test('every site carries a valid confidence', () => {
+    for (const s of sites) {
+      expect(['high', 'medium', 'low']).toContain(s.confidence);
+    }
+  });
+
+  test('componentsByDensity ranks the densest INCLUDED-site file first', () => {
+    expect(inventory.componentsByDensity[0].file).toContain('ProfileCard');
+    // monotonic non-increasing counts
+    for (let i = 1; i < inventory.componentsByDensity.length; i++) {
+      expect(inventory.componentsByDensity[i - 1].count).toBeGreaterThanOrEqual(
+        inventory.componentsByDensity[i].count,
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// counts by kind
+// ---------------------------------------------------------------------------
+describe('scan — countsByKind', () => {
+  test('every kind key is present and counts match the site array', () => {
+    const expected = {
+      'jsx-text': 0,
+      placeholder: 0,
+      'aria-label': 0,
+      title: 0,
+      alt: 0,
+      toast: 0,
+      'date-intl': 0,
+    };
+    for (const s of sites) expected[s.kind] += 1;
+    expect(inventory.countsByKind).toEqual(expected);
+  });
+
+  test('attribute kinds sum to the captured attribute sites', () => {
+    const attrTotal =
+      inventory.countsByKind.placeholder +
+      inventory.countsByKind['aria-label'] +
+      inventory.countsByKind.title +
+      inventory.countsByKind.alt;
+    expect(attrTotal).toBe(
+      sites.filter((s) => ['placeholder', 'aria-label', 'title', 'alt'].includes(s.kind)).length,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// inventory schema validation (dependency-free structural validator)
+// ---------------------------------------------------------------------------
+describe('scan — inventory validates against inventory.schema.json', () => {
+  const schema = JSON.parse(
+    readFileSync(join(__dirname, '..', 'schemas', 'inventory.schema.json'), 'utf8'),
+  );
+
+  function validate(value, sch, path = '$') {
+    const errors = [];
+    const types = Array.isArray(sch.type) ? sch.type : sch.type ? [sch.type] : null;
+
+    if (sch.const !== undefined && value !== sch.const) {
+      errors.push(`${path}: expected const ${JSON.stringify(sch.const)}, got ${JSON.stringify(value)}`);
+    }
+    if (sch.enum && !sch.enum.includes(value)) {
+      errors.push(`${path}: ${JSON.stringify(value)} not in enum`);
+    }
+    if (types) {
+      const ok = types.some((t) => typeMatch(value, t));
+      if (!ok) {
+        errors.push(`${path}: type mismatch, want ${types.join('|')}, got ${jsType(value)}`);
+        return errors; // no point descending on a type mismatch
+      }
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value) && (sch.type === 'object' || (types && types.includes('object')))) {
+      for (const req of sch.required || []) {
+        if (!(req in value)) errors.push(`${path}: missing required "${req}"`);
+      }
+      if (sch.additionalProperties === false) {
+        for (const k of Object.keys(value)) {
+          if (!sch.properties || !(k in sch.properties)) {
+            errors.push(`${path}: additional property "${k}" not allowed`);
+          }
+        }
+      }
+      for (const [k, subSchema] of Object.entries(sch.properties || {})) {
+        if (k in value) errors.push(...validate(value[k], subSchema, `${path}.${k}`));
+      }
+    }
+    if (Array.isArray(value) && sch.items) {
+      value.forEach((item, i) => errors.push(...validate(item, sch.items, `${path}[${i}]`)));
+    }
+    return errors;
+  }
+
+  function jsType(v) {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return 'array';
+    if (Number.isInteger(v)) return 'integer';
+    return typeof v;
+  }
+  function typeMatch(v, t) {
+    switch (t) {
+      case 'null': return v === null;
+      case 'array': return Array.isArray(v);
+      case 'object': return v !== null && typeof v === 'object' && !Array.isArray(v);
+      case 'integer': return Number.isInteger(v);
+      case 'number': return typeof v === 'number';
+      case 'string': return typeof v === 'string';
+      case 'boolean': return typeof v === 'boolean';
+      default: return false;
+    }
+  }
+
+  test('the persisted inventory (JSON round-trip) has zero schema violations', () => {
+    // round-trip through JSON to drop the non-enumerable _meta, exactly as the
+    // CLI persists it — that is what gets validated.
+    const persisted = JSON.parse(JSON.stringify(inventory));
+    const errors = validate(persisted, schema);
+    expect(errors).toEqual([]);
+  });
+
+  test('_meta is non-enumerable (excluded from the persisted shape)', () => {
+    expect(Object.keys(inventory)).not.toContain('_meta');
+    expect(inventory._meta).toBeDefined(); // still readable in-memory for the brief
+  });
+});
+
+// ---------------------------------------------------------------------------
+// six-block brief
+// ---------------------------------------------------------------------------
+describe('brief — emits all six blocks with grounded numbers', () => {
+  const md = brief(inventory, { date: '2026-06-21' });
+
+  test('all six block headings are present, in order', () => {
+    const order = [
+      '## 1. Framework & i18n detection',
+      '## 2. Surface inventory',
+      '## 3. String-source audit (counts by kind)',
+      '## 4. Existing-localization map',
+      '## 5. Gap + phased plan',
+      '## 6. Stack-specific gotchas',
+    ];
+    let last = -1;
+    for (const h of order) {
+      const idx = md.indexOf(h);
+      expect(idx).toBeGreaterThan(last);
+      last = idx;
+    }
+  });
+
+  test('block 1 reports the detected framework + router + turbopack', () => {
+    expect(md).toMatch(/Router type:\*\* app/);
+    expect(md).toMatch(/i18n framework:\*\* none/);
+    expect(md).toMatch(/Turbopack:\*\* yes/);
+  });
+
+  test('block 3 surfaces the excluded structural Intl count', () => {
+    expect(md).toMatch(/structural `Intl` site\(s\) flagged EXCLUDED/);
+    expect(md).toMatch(/birthDateTime\.ts/);
+  });
+
+  test('block 6 surfaces the dynamic-route glob gotcha for [shareId]', () => {
+    expect(md).toMatch(/Dynamic-route ESLint glob/);
+    expect(md).toMatch(/minimatch char class/);
+  });
+
+  test('block 2 density table leads with the densest component', () => {
+    const block2 = md.slice(md.indexOf('## 2.'), md.indexOf('## 3.'));
+    expect(block2).toMatch(/ProfileCard\.tsx/);
+  });
+});

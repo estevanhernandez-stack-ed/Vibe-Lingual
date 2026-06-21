@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/estevanhernandez-stack-ed/Vibe-Lingual/schemas/inventory.schema.json",
+  "title": "vibe-lingual inventory",
+  "description": "Output of `vibe-lingual scan` — the string-site inventory + the app/existing-i18n detection it builds on. Read-only; consumed by audit and localize.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "app", "existingI18n", "sites", "countsByKind", "componentsByDensity"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "framework", "routerType", "turbopack", "ssrFiles"],
+      "properties": {
+        "root": { "type": "string" },
+        "framework": {
+          "type": "string",
+          "enum": ["next-intl", "react-i18next", "react-intl", "lingui", "i18next", "none"]
+        },
+        "routerType": { "type": "string", "enum": ["app", "pages", "unknown"] },
+        "turbopack": { "type": "boolean" },
+        "ssrFiles": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "existingI18n": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lib", "languageList", "localePref"],
+      "properties": {
+        "lib": { "type": ["string", "null"] },
+        "languageList": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["file", "symbol"],
+          "properties": {
+            "file": { "type": "string" },
+            "symbol": { "type": "string" }
+          }
+        },
+        "localePref": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["file", "symbol"],
+          "properties": {
+            "file": { "type": "string" },
+            "symbol": { "type": "string" }
+          }
+        }
+      }
+    },
+    "sites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "file",
+          "line",
+          "kind",
+          "text",
+          "suggestedNamespace",
+          "suggestedKey",
+          "confidence",
+          "structuralIntl"
+        ],
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 0 },
+          "kind": {
+            "type": "string",
+            "enum": ["jsx-text", "placeholder", "aria-label", "title", "alt", "toast", "date-intl"]
+          },
+          "text": { "type": "string" },
+          "suggestedNamespace": { "type": "string" },
+          "suggestedKey": { "type": "string" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "structuralIntl": { "type": "boolean" },
+          "excluded": { "type": "boolean" },
+          "excludedReason": { "type": "string" }
+        }
+      }
+    },
+    "countsByKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsx-text", "placeholder", "aria-label", "title", "alt", "toast", "date-intl"],
+      "properties": {
+        "jsx-text": { "type": "integer", "minimum": 0 },
+        "placeholder": { "type": "integer", "minimum": 0 },
+        "aria-label": { "type": "integer", "minimum": 0 },
+        "title": { "type": "integer", "minimum": 0 },
+        "alt": { "type": "integer", "minimum": 0 },
+        "toast": { "type": "integer", "minimum": 0 },
+        "date-intl": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "componentsByDensity": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "count"],
+        "properties": {
+          "file": { "type": "string" },
+          "count": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

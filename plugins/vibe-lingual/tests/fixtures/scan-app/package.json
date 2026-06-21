@@ -1,0 +1,6 @@
+{
+  "name": "scan-app-fixture",
+  "private": true,
+  "scripts": { "dev": "next dev --turbo" },
+  "dependencies": { "next": "16.0.0", "react": "19.0.0" }
+}
