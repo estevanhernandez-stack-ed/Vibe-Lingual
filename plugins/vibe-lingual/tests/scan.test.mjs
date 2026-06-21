@@ -64,6 +64,68 @@ describe('scan — (i) structural Intl is flagged, not included', () => {
 });
 
 // ---------------------------------------------------------------------------
+// (i-b) KTD-5 — the dogfood miss: a BARE machine-locale (en-CA, NO timeZone)
+// ISO-date-key call assigned to a const inside a component and used in
+// comparison LOGIC (not rendered in JSX) is STRUCTURAL. The old classifier only
+// marked machine-locale calls structural when a timeZone option was present
+// (the birthDateTime shape), so DashboardShell's `new Date().toLocaleDateString
+// ('en-CA')` date-keys slipped through as structuralIntl:false. A later
+// useFormatter rewrite would break the streak/daily-key comparison.
+// (structural-green != works: the aaa lesson — assert the dogfood-surfaced shape.)
+// ---------------------------------------------------------------------------
+describe('scan — (i-b) bare machine-locale date-key in a component is STRUCTURAL', () => {
+  const dash = at('date-intl').filter((s) => s.file.includes('DashboardShell'));
+
+  test('both bare en-CA date-key calls (no timeZone, not in JSX) are flagged structuralIntl + excluded', () => {
+    const keys = dash.filter((s) => s.text.includes('en-CA'));
+    expect(keys.length).toBe(2);
+    for (const s of keys) {
+      expect(s.structuralIntl).toBe(true);
+      expect(s.excluded).toBe(true);
+      expect(s.confidence).toBe('low');
+      expect(s.excludedReason).toMatch(/not rendered in JSX/);
+    }
+  });
+
+  test('a PRESENTATIONAL machine-locale date rendered in JSX text stays included (not excluded)', () => {
+    const rendered = dash.find((s) => s.text.includes('en-US'));
+    expect(rendered).toBeDefined();
+    expect(rendered.structuralIntl).toBe(false);
+    expect(rendered.excluded).toBeUndefined();
+    expect(rendered.confidence).toBe('low');
+  });
+
+  test('the structural date-keys do not inflate DashboardShell density', () => {
+    // DashboardShell's only INCLUDED sites are the <h1> copy + the rendered date;
+    // the two excluded date-keys must not be counted.
+    const row = inventory.componentsByDensity.find((c) => c.file.includes('DashboardShell'));
+    const includedInFile = included.filter((s) => s.file.includes('DashboardShell')).length;
+    expect(row).toBeDefined();
+    expect(row.count).toBe(includedInFile);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (iv-b) developer-facing invariant Error messages are NOT captured as toasts.
+// The dogfood OVER-CAPTURED three hook-provider guards
+// ('useAuth must be used within an AuthProvider', etc.) as localizable toast
+// sites at medium confidence. These are dev-only assertions that never reach a
+// user and must never be translated. The genuine user-facing Error in the same
+// file MUST still be captured (the guard is shape-scoped, not a blanket skip).
+// ---------------------------------------------------------------------------
+describe('scan — (iv-b) dev invariant Error messages are excluded, real ones kept', () => {
+  const allText = sites.map((s) => s.text);
+
+  test('a hook-provider "must be used within" invariant is NOT captured', () => {
+    expect(allText).not.toContain('useAuth must be used within an AuthProvider');
+  });
+
+  test('a genuine user-facing Error string in the same file IS still captured', () => {
+    expect(textsOf('toast')).toContain('Could not load your account');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // (ii) CSS-className / data-attr / test-id false positives must NOT be extracted
 // ---------------------------------------------------------------------------
 describe('scan — (ii) machinery strings are NOT treated as user-facing', () => {

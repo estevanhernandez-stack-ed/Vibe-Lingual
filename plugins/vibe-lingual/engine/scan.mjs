@@ -202,6 +202,38 @@ function isIdentifierShaped(s) {
   return false;
 }
 
+// Developer-facing INVARIANT / assertion messages that ship inside `new Error(...)`
+// (or `throw new Error(...)`) but never reach a user — React hook-provider guards,
+// "not defined" / "expected X to be Y" assertions, "should never happen" branches.
+// These must NOT enter the localization surface: translating a dev assertion is
+// pure noise and risks a translator "fixing" a string that code-paths assert on.
+//
+// Shapes (from the Celestia3 dogfood, where the scanner wrongly captured three
+// hook-provider invariants as kind=toast at medium confidence):
+//   - 'useAuth must be used within an AuthProvider'   (hook-context guard)
+//   - 'useSettings must be used within a SettingsProvider'
+//   - 'useSubscription must be used within a SubscriptionProvider'
+// Generalized: "must be used within", "is not defined", "expected … to be …",
+// "should never happen", "unreachable", "invariant", "assertion failed", and the
+// hook-name-prefixed `useXxx must …` shape.
+const DEV_INVARIANT_RES = [
+  /\bmust be used within\b/i,
+  /\bis not defined\b/i,
+  /\bexpected\b.+\bto be\b/i,
+  /\bshould never happen\b/i,
+  /\bunreachable\b/i,
+  /\binvariant\b/i,
+  /\bassertion failed\b/i,
+  /\bnot implemented\b/i,
+  /^use[A-Z]\w*\b.*\bmust\b/, // useXxx must …  (hook-context guard)
+];
+
+function isDevInvariantMessage(s) {
+  const t = String(s).trim();
+  if (!t) return false;
+  return DEV_INVARIANT_RES.some((re) => re.test(t));
+}
+
 // Final gate for whether a candidate string is user-facing copy worth a site.
 // `kind` lets the gate apply a kind-specific floor: a JSX-text node that is a
 // single token of <=2 chars is below the floor for a standalone translation key —
@@ -304,6 +336,17 @@ function classifyIntlSite({ localeArg, hasTimeZoneOpt, hasFormatToParts, inCompo
   if (hasFormatToParts) return { structural: true, reason: 'formatToParts consumer (locale-invariant parsing)' };
   if (localeArg && MACHINE_LOCALE_RE.test(localeArg) && hasTimeZoneOpt) {
     return { structural: true, reason: 'fixed machine locale + explicit timeZone (tz-offset math)' };
+  }
+  // KTD-5 (the dogfood miss): a BARE fixed machine locale (en-CA/en-US/en-GB/
+  // sv-SE/fr-CA, NO timeZone option) that is NOT rendered in JSX is a date-KEY,
+  // not display copy — `new Date().toLocaleDateString('en-CA')` assigned to a
+  // `todayStr`/`todayKey` const and compared against a stored ISO date. The
+  // machine locale is there to force a stable ISO/locale-invariant string for
+  // LOGIC, not to show the user anything. Extracting it (a later useFormatter
+  // rewrite) would corrupt the streak/daily-key comparison. Classify structural
+  // regardless of timeZone presence whenever the result is not in the JSX tree.
+  if (localeArg && MACHINE_LOCALE_RE.test(localeArg) && !insideJsx) {
+    return { structural: true, reason: 'fixed machine locale, not rendered in JSX (date-key logic, not display)' };
   }
   // a date formatter in a non-component lib/util file, not rendered in JSX → structural by location.
   if (!inComponentFile && !insideJsx) {
@@ -438,7 +481,10 @@ function scanFile(absPath, relPosix, text) {
     if (node.type === 'NewExpression' && node.callee && node.callee.type === 'Identifier' && /Error$/.test(node.callee.name)) {
       const arg = node.arguments && node.arguments[0];
       const val = stringLiteralValue(arg);
-      if (val != null && isUserFacingText(val)) {
+      // Skip developer-facing invariant/assertion Error messages — these never
+      // reach a user and must never be translated (the hook-provider-guard case
+      // the Celestia3 dogfood over-captured).
+      if (val != null && isUserFacingText(val) && !isDevInvariantMessage(val)) {
         sites.push(makeSite(relPosix, lineOf(node), 'toast', val.trim(), namespace));
       }
       return;
