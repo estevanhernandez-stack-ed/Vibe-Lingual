@@ -35,6 +35,17 @@ import {
 import { join, dirname, relative, sep } from 'node:path';
 
 const BACKUP_ROOT = join('.vibe-lingual', 'localize', 'backup');
+// The extract ledger + staged manifest live alongside the backups under
+// .vibe-lingual/localize/. rollback must keep them COHERENT with the source it
+// restores: a file restored to its pre-extract bytes is no longer extracted, so
+// its ledger 'written' entry (and any staged-manifest entry from a promoted batch)
+// is now a LIE — left in place, the next extract run sees 'written' and reports
+// `skipped-done`, silently refusing to re-extract a rolled-back file. These paths
+// are duplicated from extract.mjs deliberately: backup.mjs must NOT import
+// extract.mjs (extract.mjs imports backup.mjs — that would be a cycle). They are a
+// stable on-disk contract; a change in one place updates the other.
+const LEDGER_PATH = join('.vibe-lingual', 'localize', 'state', 'extract-ledger.json');
+const STAGED_MANIFEST_PATH = join('.vibe-lingual', 'localize', 'staged', 'staged-manifest.json');
 
 // ---------------------------------------------------------------------------
 // batch ids — a filesystem-safe ISO timestamp. The localize SKILL's --rollback
@@ -133,11 +144,72 @@ export class BackupBatch {
 }
 
 // ---------------------------------------------------------------------------
-// rollback — restore every file in a batch to its exact original bytes.
-//   rollback(appRoot, batchIdOrIso) -> { ok, batchId, restored[], missing[], error? }
+// ledger + staged-manifest coherence — after a rollback restores a file to its
+// pre-extract bytes, the extract ledger entry that marked it 'written' is stale.
+// Prune the restored files from the ledger so the next extract run re-extracts
+// them instead of reporting `skipped-done`. Best-effort: a missing/unreadable
+// ledger is a no-op (nothing to prune). Returns the list of pruned rel paths.
+// ---------------------------------------------------------------------------
+
+function readJsonSafe(absPath) {
+  if (!existsSync(absPath)) return null;
+  try {
+    return JSON.parse(readFileSync(absPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function pruneLedger(appRoot, restoredRelPaths) {
+  const ledgerAbs = join(appRoot, LEDGER_PATH);
+  const ledger = readJsonSafe(ledgerAbs);
+  if (!ledger || !ledger.files || typeof ledger.files !== 'object') return [];
+  const pruned = [];
+  for (const rel of restoredRelPaths) {
+    if (Object.prototype.hasOwnProperty.call(ledger.files, rel)) {
+      delete ledger.files[rel];
+      pruned.push(rel);
+    }
+  }
+  if (pruned.length > 0) {
+    writeFileSync(ledgerAbs, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
+  }
+  return pruned;
+}
+
+// A promoted-from-staged batch (--apply-staged) already deletes the staged-manifest
+// entry on promotion, so a rollback of THAT batch normally finds nothing to prune.
+// But prune defensively: if any restored file still carries a staged-manifest entry
+// (e.g. a batch rolled back out of order), drop it so the staged mirror does not
+// re-offer a rewrite for a file that has been returned to source.
+function pruneStagedManifest(appRoot, restoredRelPaths) {
+  const manifestAbs = join(appRoot, STAGED_MANIFEST_PATH);
+  const manifest = readJsonSafe(manifestAbs);
+  if (!manifest || !manifest.files || typeof manifest.files !== 'object') return [];
+  const pruned = [];
+  for (const rel of restoredRelPaths) {
+    if (Object.prototype.hasOwnProperty.call(manifest.files, rel)) {
+      delete manifest.files[rel];
+      pruned.push(rel);
+    }
+  }
+  if (pruned.length > 0) {
+    writeFileSync(manifestAbs, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+  }
+  return pruned;
+}
+
+// ---------------------------------------------------------------------------
+// rollback — restore every file in a batch to its exact original bytes, then
+// PRUNE the restored files from the extract ledger + staged manifest so engine
+// state stays coherent with the source it just reverted.
+//   rollback(appRoot, batchIdOrIso) ->
+//     { ok, batchId, restored[], missing[], ledgerPruned[], stagedPruned[], error? }
 // Strategy: read the manifest (the source-of-truth mapping), copy each backed-up
 // file back over its source path. A backup file that has gone missing is reported
 // (never silently skipped). Restores from the BUFFER so the round-trip is exact.
+// The ledger/manifest prune runs ONLY over files actually restored — a partial
+// restore (some backups missing) never prunes a file it could not revert.
 // ---------------------------------------------------------------------------
 
 export function rollback(appRoot, batchIdOrIso) {
@@ -186,11 +258,20 @@ export function rollback(appRoot, batchIdOrIso) {
     restored.push(entry.source);
   }
 
+  // coherence: prune the RESTORED files from the extract ledger + staged manifest
+  // so the next extract run does not report `skipped-done` on a rolled-back file.
+  // Only the files we actually reverted are pruned (a missing backup left its
+  // ledger entry intact — that file was not restored, so its 'written' state holds).
+  const ledgerPruned = pruneLedger(appRoot, restored);
+  const stagedPruned = pruneStagedManifest(appRoot, restored);
+
   return {
     ok: missing.length === 0,
     batchId,
     restored,
     missing,
+    ledgerPruned,
+    stagedPruned,
     error: missing.length > 0 ? `${missing.length} backup file(s) missing — partial restore` : undefined,
   };
 }

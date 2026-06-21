@@ -387,6 +387,129 @@ describe('test-harness collateral — discover + back up + wrap (M8 AC)', () => 
   });
 });
 
+// THE MULTI-RENDER BUG (M8 safety-claim failure). The dominant React Testing
+// Library pattern is one render() per test() block, so a real test file has N
+// render(<Component/>) calls. A regex pass with a NON-global match rewrote only the
+// FIRST and left the other N-1 BARE — each bare render of the now-i18n'd component
+// throws `No intl context found` at test time → the app's own suite goes RED after
+// an auto-write, while the engine reported `collateralTestsWrapped: 1,
+// collateralTestsNeedManualWrap: 0` (a green banner over a red suite). The AST wrap
+// must touch EVERY render call, and any render it CANNOT wrap (a non-JSX arg) must
+// flow into collateralTestsNeedManualWrap so the banner warns.
+const MULTI_RENDER_TEST = `import { render, screen } from '@testing-library/react';
+import Greeting from './Greeting';
+
+test('renders the greeting', () => {
+  render(<Greeting />);
+  expect(screen.getByText('Welcome back')).toBeTruthy();
+});
+
+test('renders with a name', () => {
+  render(<Greeting name="Este" />);
+});
+
+test('renders the empty state', () => {
+  render(<Greeting empty />);
+});
+`;
+
+describe('test-harness collateral — EVERY render() call wrapped (multi-render fix)', () => {
+  let root;
+  beforeEach(() => {
+    root = tmpApp();
+    write(root, 'src/components/Greeting.tsx', HIGH_CONF_CLIENT);
+    write(root, 'src/components/Greeting.test.tsx', MULTI_RENDER_TEST);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  test('all THREE render calls get the provider — not just the first (the regression)', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root });
+
+    const testNow = readFileSync(join(root, 'src/components/Greeting.test.tsx'), 'utf8');
+    // exactly three NextIntlClientProvider OPEN tags — one per render call. Counting
+    // open tags (not bare occurrences) so the import line doesn't inflate the count.
+    const openTags = (testNow.match(/<NextIntlClientProvider/g) || []).length;
+    expect(openTags).toBe(3);
+    // and NO bare render(<Greeting — every render's first arg is now the provider.
+    expect(/render\(\s*<Greeting/.test(testNow)).toBe(false);
+  });
+
+  test('the summary reports all three wrapped, zero needing a manual wrap', () => {
+    const inv = scan(root, detect(root));
+    const report = extract(inv, { appRoot: root });
+    // PER-RENDER-CALL accounting: 3 calls wrapped, not "1 file wrapped".
+    expect(report.summary.collateralTestsWrapped).toBe(3);
+    expect(report.summary.collateralTestsNeedManualWrap).toBe(0);
+  });
+
+  test('the wrapped suite no longer leaves a bare render (the live-red scenario)', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root });
+    const testNow = readFileSync(join(root, 'src/components/Greeting.test.tsx'), 'utf8');
+    // the import is present exactly once
+    expect((testNow.match(/import \{ NextIntlClientProvider \}/g) || []).length).toBe(1);
+    // the non-render assertion line is preserved untouched (recast keeps it)
+    expect(testNow).toContain("expect(screen.getByText('Welcome back')).toBeTruthy()");
+  });
+
+  test('rollback restores the multi-render test byte-for-byte', () => {
+    const inv = scan(root, detect(root));
+    const report = extract(inv, { appRoot: root });
+    expect(readFileSync(join(root, 'src/components/Greeting.test.tsx'), 'utf8')).not.toBe(MULTI_RENDER_TEST);
+    const rb = rollback(root, report.batchId);
+    expect(rb.ok).toBe(true);
+    expect(readFileSync(join(root, 'src/components/Greeting.test.tsx'), 'utf8')).toBe(MULTI_RENDER_TEST);
+  });
+});
+
+// A render() call whose first argument is NOT JSX (render(ui), render(buildUI()))
+// cannot be wrapped as JSX without breaking it. The engine must leave it as-is AND
+// count it into collateralTestsNeedManualWrap so the banner warns — never silently
+// claim a fully-wrapped suite when a render was left bare.
+const MIXED_RENDER_TEST = `import { render, screen } from '@testing-library/react';
+import Greeting from './Greeting';
+
+test('direct render', () => {
+  render(<Greeting />);
+});
+
+test('indirect render', () => {
+  const ui = <Greeting />;
+  render(ui);
+});
+`;
+
+describe('test-harness collateral — non-JSX render args are flagged for a manual wrap', () => {
+  let root;
+  beforeEach(() => {
+    root = tmpApp();
+    write(root, 'src/components/Greeting.tsx', HIGH_CONF_CLIENT);
+    write(root, 'src/components/Greeting.test.tsx', MIXED_RENDER_TEST);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  test('the JSX render wraps, the variable render is counted as needing a manual wrap', () => {
+    const inv = scan(root, detect(root));
+    const report = extract(inv, { appRoot: root });
+
+    // file IS changed (one render wrapped) but the summary STILL warns about the
+    // unwrappable one — the green-over-red failure mode is closed.
+    expect(report.summary.collateralTestsWrapped).toBe(1);
+    expect(report.summary.collateralTestsNeedManualWrap).toBe(1);
+
+    const r = report.results.find((x) => x.file === 'src/components/Greeting.tsx');
+    const edit = r.testEdits.find((t) => t.file === 'src/components/Greeting.test.tsx');
+    expect(edit.wrappedCount).toBe(1);
+    expect(edit.needsManualWrap).toBe(1);
+    expect(edit.reason).toMatch(/non-JSX argument/);
+
+    // the variable render was left intact (not corrupted)
+    const testNow = readFileSync(join(root, 'src/components/Greeting.test.tsx'), 'utf8');
+    expect(testNow).toContain('render(ui)');
+  });
+});
+
 describe('--stage-all — force every file to staging regardless of confidence', () => {
   let root;
   beforeEach(() => {
@@ -508,5 +631,110 @@ describe('--apply-staged — promote a staged rewrite to live source', () => {
     const res = promoteStaged(root, 'src/components/Other.tsx');
     expect(res.ok).toBe(false);
     expect(readFileSync(join(root, 'src/components/Other.tsx'), 'utf8')).toBe(before);
+  });
+});
+
+// THE ROLLBACK-LEDGER COHERENCE BUG (M8). rollback() restores source bytes exactly,
+// but historically never touched the extract ledger. After --rollback, the ledger
+// still said `status: 'written'`, so the NEXT extract hit the skipped-done branch,
+// reported `skipped-done`, and the rolled-back file was SILENTLY un-re-extractable
+// (written:0, source not re-extracted) without the user deleting the ledger by hand.
+// rollback now prunes the restored files from the ledger (+ staged manifest), and
+// extract re-verifies a ledger-'written' file against the source markers as a
+// belt-and-suspenders for out-of-band reverts (git checkout / manual edit).
+describe('rollback ledger coherence — a rolled-back file is re-extractable', () => {
+  let root;
+  beforeEach(() => {
+    root = tmpApp();
+    write(root, 'src/components/Greeting.tsx', HIGH_CONF_CLIENT);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  test('rollback prunes the rolled-back file from the extract ledger', () => {
+    const inv = scan(root, detect(root));
+    const report = extract(inv, { appRoot: root });
+    // ledger recorded the write
+    const ledgerPath = join(root, '.vibe-lingual/localize/state/extract-ledger.json');
+    let ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+    expect(ledger.files['src/components/Greeting.tsx'].status).toBe('written');
+
+    const rb = rollback(root, report.batchId);
+    expect(rb.ok).toBe(true);
+    // THE FIX: the ledger entry is pruned, and rollback reports it.
+    expect(rb.ledgerPruned).toContain('src/components/Greeting.tsx');
+    ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+    expect(ledger.files['src/components/Greeting.tsx']).toBeUndefined();
+  });
+
+  test('after rollback, a fresh extract re-extracts the file (not skipped-done)', () => {
+    const inv = scan(root, detect(root));
+    const first = extract(inv, { appRoot: root });
+    expect(first.summary.written).toBe(1);
+
+    const rb = rollback(root, first.batchId);
+    expect(rb.ok).toBe(true);
+    // source is back to its pre-extract bytes
+    expect(readFileSync(join(root, 'src/components/Greeting.tsx'), 'utf8')).toBe(HIGH_CONF_CLIENT);
+
+    // re-scan (the SKILL's real flow) + re-extract — the file MUST write again, not
+    // get stuck on a stale ledger entry.
+    const inv2 = scan(root, detect(root));
+    const second = extract(inv2, { appRoot: root });
+    expect(second.summary.written).toBe(1);
+    const r = second.results.find((x) => x.file === 'src/components/Greeting.tsx');
+    expect(r.status).toBe('written');
+    // and the source is genuinely re-extracted
+    expect(readFileSync(join(root, 'src/components/Greeting.tsx'), 'utf8')).toContain(
+      "useTranslations('Greeting')",
+    );
+  });
+
+  test('belt-and-suspenders: a ledger-written file reverted OUT-OF-BAND re-extracts', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root });
+
+    // simulate a git checkout / manual revert: source goes back to pre-extract bytes
+    // WITHOUT going through rollback (so the ledger is NOT pruned — it stays stale).
+    writeFileSync(join(root, 'src/components/Greeting.tsx'), HIGH_CONF_CLIENT, 'utf8');
+    const ledgerPath = join(root, '.vibe-lingual/localize/state/extract-ledger.json');
+    expect(JSON.parse(readFileSync(ledgerPath, 'utf8')).files['src/components/Greeting.tsx'].status).toBe(
+      'written',
+    );
+
+    // re-extract: the ledger says 'written', but the source markers are gone, so the
+    // engine must NOT trust the ledger blindly — it re-extracts.
+    const inv2 = scan(root, detect(root));
+    const second = extract(inv2, { appRoot: root });
+    const r = second.results.find((x) => x.file === 'src/components/Greeting.tsx');
+    expect(r.status).toBe('written');
+    expect(readFileSync(join(root, 'src/components/Greeting.tsx'), 'utf8')).toContain('useTranslations');
+  });
+
+  test('a genuinely-extracted file (markers present) still skips on re-run (no spurious re-extract)', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root });
+    // do NOT revert — the source still has its markers. A re-extract over the SAME
+    // (un-rescanned) inventory must skip-done, not re-write.
+    const second = extract(inv, { appRoot: root });
+    const r = second.results.find((x) => x.file === 'src/components/Greeting.tsx');
+    expect(r.status).toBe('skipped-done');
+    expect(r.reason).toMatch(/source markers confirm/);
+    expect(second.summary.written).toBe(0);
+  });
+
+  test('a PROMOTED batch rollback prunes the ledger too (apply-staged coherence)', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root, stageAll: true });
+    const promoted = promoteStaged(root, 'src/components/Greeting.tsx');
+    expect(promoted.ok).toBe(true);
+
+    const rb = rollback(root, promoted.batchId);
+    expect(rb.ok).toBe(true);
+    expect(rb.ledgerPruned).toContain('src/components/Greeting.tsx');
+
+    // re-stage + re-promote works again — the file isn't stuck.
+    const inv2 = scan(root, detect(root));
+    const restaged = extract(inv2, { appRoot: root, stageAll: true });
+    expect(restaged.summary.staged).toBe(1);
   });
 });

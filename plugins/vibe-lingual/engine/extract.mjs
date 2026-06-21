@@ -37,8 +37,16 @@ import {
   rmSync,
 } from 'node:fs';
 import { join, dirname, sep } from 'node:path';
+import jscodeshiftDefault from 'jscodeshift';
 import { transform } from './adapters/next-intl/transform.mjs';
 import { BackupBatch } from './backup.mjs';
+
+// jscodeshift TS-aware parser — the collateral-test wrap is AST-based (same rigor
+// as the codemod) so a multi-render() test file gets EVERY render call wrapped,
+// not just the first. A regex pass mis-brackets adjacent nested-JSX calls and only
+// rewrites the first match; the AST visits every `render(<JSX>)` call individually.
+const jTest = jscodeshiftDefault.withParser('tsx');
+const TEST_SRC_OPTS = { quote: 'single', trailingComma: true, tabWidth: 2 };
 
 const STATE_DIR = join('.vibe-lingual', 'localize');
 const STAGED_DIR = join(STATE_DIR, 'staged');
@@ -111,6 +119,23 @@ function isClientFile(appRoot, relPath) {
   }
 }
 
+// Does the source still bear an i18n extraction marker — a next-intl translation
+// hook/import the codemod would have added? The extract ledger records a file as
+// 'written', but the ledger can go STALE: a rollback restores the source bytes to
+// their pre-extract state, OR a user reverts the file out-of-band (git checkout,
+// manual edit). A blind ledger trust then reports `skipped-done` and SILENTLY
+// refuses to re-extract a file whose translation calls are gone. Re-verifying the
+// source against these markers makes extract self-healing: a ledger-'written' file
+// whose markers have vanished is treated as eligible again, not stuck. Conservative
+// — any ONE marker present means "still extracted"; only a fully-reverted file
+// (no markers at all) re-opens for extraction.
+const I18N_MARKER_RE =
+  /\b(useTranslations|getTranslations|useFormatter)\s*\(|from\s+['"]next-intl(?:\/server)?['"]/;
+
+function sourceStillExtracted(source) {
+  return I18N_MARKER_RE.test(source);
+}
+
 // ---------------------------------------------------------------------------
 // co-located test discovery (M8 AC: "a touched component's existing test gets the
 // provider wrapper"). Adding next-intl hooks to a component breaks its EXISTING
@@ -153,39 +178,131 @@ function findCollateralTests(appRoot, relPath) {
   return found;
 }
 
-// Wrap a co-located test's render output in <NextIntlClientProvider> so the
-// existing assertions still mount the now-i18n'd component. Mechanical + best-
-// effort: it injects the import (once) and wraps the FIRST argument of each
-// `render(...)` call with the provider. When the wrap can't be applied cleanly
-// (no render() call found, or already wrapped) it returns { changed:false } and
-// the SKILL falls back to a manual instruction — but the test is STILL backed up
-// by the caller, so rollback stays coherent either way. `messages` is left as an
+// Build the <NextIntlClientProvider locale="en" messages={{}} timeZone="UTC">
+// wrapper JSX element around an existing JSX argument. `messages` is left as an
 // empty object literal: next-intl tolerates missing keys at render with the key
 // echoed back, which keeps existing assertions on non-extracted text intact, and
 // the SKILL fills real messages when it knows the namespace.
-function wrapTestWithProvider(source) {
-  if (/NextIntlClientProvider/.test(source)) {
-    return { code: source, changed: false, reason: 'already wrapped' };
-  }
-  const renderRe = /\brender\(\s*(<[A-Za-z][\w.]*[\s\S]*?\/>|<[A-Za-z][\w.]*[\s\S]*?>[\s\S]*?<\/[A-Za-z][\w.]*>)/;
-  if (!renderRe.test(source)) {
-    return { code: source, changed: false, reason: 'no render(<JSX>) call to wrap' };
-  }
-  let out = source.replace(
-    renderRe,
-    (m, jsx) =>
-      `render(\n    <NextIntlClientProvider locale="en" messages={{}} timeZone="UTC">\n      ${jsx}\n    </NextIntlClientProvider>`,
+function buildProviderWrap(j, jsxArg) {
+  const open = j.jsxOpeningElement(
+    j.jsxIdentifier('NextIntlClientProvider'),
+    [
+      j.jsxAttribute(j.jsxIdentifier('locale'), j.stringLiteral('en')),
+      j.jsxAttribute(
+        j.jsxIdentifier('messages'),
+        j.jsxExpressionContainer(j.objectExpression([])),
+      ),
+      j.jsxAttribute(j.jsxIdentifier('timeZone'), j.stringLiteral('UTC')),
+    ],
+    false,
   );
-  // inject the import once, after the last existing import (or at the top).
-  const importLine = "import { NextIntlClientProvider } from 'next-intl';\n";
-  const lastImport = [...out.matchAll(/^import .*;?\s*$/gm)].pop();
-  if (lastImport) {
-    const idx = lastImport.index + lastImport[0].length;
-    out = out.slice(0, idx) + '\n' + importLine.trimEnd() + out.slice(idx);
-  } else {
-    out = importLine + out;
+  const close = j.jsxClosingElement(j.jsxIdentifier('NextIntlClientProvider'));
+  // newline children keep recast's output readable when it reprints the call.
+  return j.jsxElement(open, close, [j.jsxText('\n      '), jsxArg, j.jsxText('\n    ')]);
+}
+
+// Is this JSX node ALREADY wrapped in a NextIntlClientProvider (idempotency at the
+// per-render-call level, not just file-level)? A second run must not double-wrap.
+function isProviderWrapped(node) {
+  return (
+    node &&
+    node.type === 'JSXElement' &&
+    node.openingElement &&
+    node.openingElement.name &&
+    node.openingElement.name.name === 'NextIntlClientProvider'
+  );
+}
+
+// Wrap a co-located test's render output in <NextIntlClientProvider> so the
+// existing assertions still mount the now-i18n'd component. AST-based (jscodeshift)
+// so EVERY `render(<JSX>)` call in the file is wrapped — the dominant React Testing
+// Library pattern is one render() per `test()` block, and a regex pass rewrote only
+// the FIRST, leaving the other N-1 renders BARE (each throws `No intl context found`
+// → the app's own suite goes RED after an auto-write while the engine reported
+// success). Per call:
+//   - arg0 is a JSXElement/JSXFragment not yet provider-wrapped → wrap it (wrapped++).
+//   - arg0 is already provider-wrapped → skip (idempotent), counts as neither.
+//   - arg0 is NOT JSX (a variable, a function call) → CANNOT wrap cleanly; left as
+//     is and counted into `manual` so the caller surfaces it for a hand wrap.
+//
+// Returns { code, changed, wrapped, manual, reason }:
+//   wrapped — number of render calls the provider was applied to.
+//   manual  — number of render calls that could not be wrapped cleanly (need a
+//             hand wrap); these MUST flow into the run's collateralTestsNeedManualWrap
+//             so a green banner is never rendered over a suite that will go red.
+//   changed — true iff at least one render call was wrapped.
+// When the wrap can't be applied to ANY call (no render(<JSX>) found, parse error)
+// it returns { changed:false } with a reason and the SKILL falls back to a manual
+// instruction — the test is STILL backed up by the caller, so rollback stays
+// coherent either way.
+function wrapTestWithProvider(source) {
+  let root;
+  try {
+    root = jTest(source);
+  } catch (e) {
+    return { code: source, changed: false, wrapped: 0, manual: 0, reason: `unparseable test (${e.message})` };
   }
-  return { code: out, changed: true };
+
+  let wrapped = 0;
+  let manual = 0;
+  let alreadyWrapped = 0;
+
+  // every `render(...)` call — bare callee identifier `render`. (RTL's customRender
+  // wrappers are out of scope; the cowpath uses the standard `render`.)
+  root.find(jTest.CallExpression, { callee: { type: 'Identifier', name: 'render' } }).forEach((p) => {
+    const arg0 = p.node.arguments && p.node.arguments[0];
+    if (!arg0) {
+      manual += 1;
+      return;
+    }
+    if (isProviderWrapped(arg0)) {
+      alreadyWrapped += 1;
+      return;
+    }
+    if (arg0.type === 'JSXElement' || arg0.type === 'JSXFragment') {
+      p.node.arguments[0] = buildProviderWrap(jTest, arg0);
+      wrapped += 1;
+      return;
+    }
+    // a non-JSX render arg (render(ui), render(buildUI())) — cannot wrap as JSX
+    // without breaking it. Flag for a manual wrap; never corrupt the call.
+    manual += 1;
+  });
+
+  if (wrapped === 0) {
+    // nothing wrapped. If renders existed but were all non-JSX, say so; if some
+    // were already wrapped (re-run), it's a clean idempotent no-op; else no render.
+    let reason;
+    if (manual > 0) reason = `${manual} render call(s) take a non-JSX argument — wrap manually`;
+    else if (alreadyWrapped > 0) reason = 'already wrapped';
+    else reason = 'no render(<JSX>) call to wrap';
+    return { code: source, changed: false, wrapped: 0, manual, reason };
+  }
+
+  // inject the import once (skip if a NextIntlClientProvider import already exists).
+  const hasImport =
+    root
+      .find(jTest.ImportDeclaration, { source: { value: 'next-intl' } })
+      .filter((p) =>
+        (p.node.specifiers || []).some(
+          (s) => s.type === 'ImportSpecifier' && s.imported && s.imported.name === 'NextIntlClientProvider',
+        ),
+      )
+      .size() > 0;
+  if (!hasImport) {
+    const decl = jTest.importDeclaration(
+      [jTest.importSpecifier(jTest.identifier('NextIntlClientProvider'))],
+      jTest.stringLiteral('next-intl'),
+    );
+    const imports = root.find(jTest.ImportDeclaration);
+    if (imports.size() > 0) {
+      imports.at(imports.size() - 1).insertAfter(decl);
+    } else {
+      root.get().node.program.body.unshift(decl);
+    }
+  }
+
+  return { code: root.toSource(TEST_SRC_OPTS), changed: true, wrapped, manual };
 }
 
 // ---------------------------------------------------------------------------
@@ -368,24 +485,7 @@ export function extract(inventory, options = {}) {
       continue;
     }
 
-    // already auto-written in a prior run? skip (resumability).
-    const prior = ledger.files[file];
-    if (prior && prior.status === 'written' && !dryRun) {
-      results.push({
-        file,
-        route,
-        confidence,
-        status: 'skipped-done',
-        reason: 'already extracted in a prior run (ledger)',
-        changed: false,
-        keys: prior.keys || {},
-        catalog: prior.catalog || null,
-        backupPath: prior.backupPath || null,
-      });
-      continue;
-    }
-
-    // run the codemod in-process to get the rewritten source + the catalog keys.
+    // read the source up front — both the ledger re-verify and the codemod need it.
     let source;
     try {
       source = readFileSync(join(appRoot, file), 'utf8');
@@ -402,6 +502,35 @@ export function extract(inventory, options = {}) {
         backupPath: null,
       });
       continue;
+    }
+
+    // already auto-written in a prior run? skip (resumability) — but ONLY if the
+    // source still bears the i18n markers the prior run added. The ledger can go
+    // stale: a rollback (or any out-of-band revert) restores the pre-extract bytes
+    // while leaving the ledger entry 'written'. Blindly trusting it reports
+    // `skipped-done` and silently refuses to re-extract a reverted file (the
+    // coherence bug). Re-verify: markers present → genuinely done, skip; markers
+    // gone → the ledger lies, fall through and re-extract. (rollback now prunes the
+    // ledger directly, so this is the belt-and-suspenders for git/manual reverts.)
+    const prior = ledger.files[file];
+    if (prior && prior.status === 'written' && !dryRun) {
+      if (sourceStillExtracted(source)) {
+        results.push({
+          file,
+          route,
+          confidence,
+          status: 'skipped-done',
+          reason: 'already extracted in a prior run (ledger, source markers confirm)',
+          changed: false,
+          keys: prior.keys || {},
+          catalog: prior.catalog || null,
+          backupPath: prior.backupPath || null,
+        });
+        continue;
+      }
+      // markers vanished — the ledger entry is stale (reverted out-of-band). Drop
+      // it so the write below records a fresh entry, and fall through to re-extract.
+      delete ledger.files[file];
     }
 
     const isClient = isClientFile(appRoot, file);
@@ -521,13 +650,23 @@ export function extract(inventory, options = {}) {
       for (const testRel of collateralTests) {
         const testBackup = batch.backupFile(testRel);
         const testSrc = readFileSync(join(appRoot, testRel), 'utf8');
-        const wrapped = wrapTestWithProvider(testSrc);
-        if (wrapped.changed) writeFileSync(join(appRoot, testRel), wrapped.code, 'utf8');
+        const wrap = wrapTestWithProvider(testSrc);
+        if (wrap.changed) writeFileSync(join(appRoot, testRel), wrap.code, 'utf8');
+        // per-RENDER-CALL accounting: a test file with N render() calls reports how
+        // many were provider-wrapped vs how many still need a hand wrap. A file
+        // where some renders wrapped and some did not is BOTH changed:true AND
+        // needsManualWrap>0 — the banner must warn even though the file changed.
         testEdits.push({
           file: testRel,
           backupPath: testBackup,
-          wrapped: wrapped.changed,
-          reason: wrapped.changed ? 'provider-wrapped' : `not auto-wrapped (${wrapped.reason}) — wrap manually`,
+          wrapped: wrap.changed,
+          wrappedCount: wrap.wrapped,
+          needsManualWrap: wrap.manual,
+          reason: wrap.changed
+            ? wrap.manual > 0
+              ? `${wrap.wrapped} render call(s) provider-wrapped; ${wrap.manual} take a non-JSX argument — wrap those manually`
+              : 'provider-wrapped'
+            : `not auto-wrapped (${wrap.reason}) — wrap manually`,
         });
       }
       writeFileSync(join(appRoot, file), out.code, 'utf8');
@@ -590,13 +729,39 @@ export function extract(inventory, options = {}) {
     // collateral-test accounting — how many co-located tests were touched, and how
     // many auto-wrapped vs need a manual wrap. Surfaced so the SKILL can warn before
     // the suite goes red, and so rollback coverage is auditable.
+    //
+    // The counts are per-RENDER-CALL, not per-file: a test file with 3 render()
+    // calls where 1 wrapped and 2 take a non-JSX arg contributes 1 to wrapped and
+    // 2 to needManualWrap — even though the FILE changed. This is the M8 safety
+    // fix: a file that wrapped SOME renders but left others bare must still warn,
+    // or the banner shows green over a suite that throws `No intl context found`.
     collateralTests: results.reduce((n, x) => n + (x.collateralTests ? x.collateralTests.length : 0), 0),
     collateralTestsWrapped: results.reduce(
-      (n, x) => n + (x.testEdits ? x.testEdits.filter((t) => t.wrapped).length : 0),
+      (n, x) =>
+        n +
+        (x.testEdits
+          ? x.testEdits.reduce(
+              (m, t) => m + (typeof t.wrappedCount === 'number' ? t.wrappedCount : t.wrapped ? 1 : 0),
+              0,
+            )
+          : 0),
       0,
     ),
     collateralTestsNeedManualWrap: results.reduce(
-      (n, x) => n + (x.testEdits ? x.testEdits.filter((t) => !t.wrapped).length : 0),
+      (n, x) =>
+        n +
+        (x.testEdits
+          ? x.testEdits.reduce(
+              (m, t) =>
+                m +
+                (typeof t.needsManualWrap === 'number'
+                  ? t.needsManualWrap
+                  : t.wrapped
+                  ? 0
+                  : 1),
+              0,
+            )
+          : 0),
       0,
     ),
   };
@@ -684,13 +849,19 @@ export function promoteStaged(appRoot, file, options = {}) {
     if (!existsSync(join(appRoot, testRel))) continue;
     const testBackup = batch.backupFile(testRel);
     const testSrc = readFileSync(join(appRoot, testRel), 'utf8');
-    const wrapped = wrapTestWithProvider(testSrc);
-    if (wrapped.changed) writeFileSync(join(appRoot, testRel), wrapped.code, 'utf8');
+    const wrap = wrapTestWithProvider(testSrc);
+    if (wrap.changed) writeFileSync(join(appRoot, testRel), wrap.code, 'utf8');
     testEdits.push({
       file: testRel,
       backupPath: testBackup,
-      wrapped: wrapped.changed,
-      reason: wrapped.changed ? 'provider-wrapped' : `not auto-wrapped (${wrapped.reason}) — wrap manually`,
+      wrapped: wrap.changed,
+      wrappedCount: wrap.wrapped,
+      needsManualWrap: wrap.manual,
+      reason: wrap.changed
+        ? wrap.manual > 0
+          ? `${wrap.wrapped} render call(s) provider-wrapped; ${wrap.manual} take a non-JSX argument — wrap those manually`
+          : 'provider-wrapped'
+        : `not auto-wrapped (${wrap.reason}) — wrap manually`,
     });
   }
 

@@ -25,7 +25,7 @@ If `inventory.json` or `audit.json` is missing, tell the user to run `/vibe-ling
 | Flag | Effect |
 |---|---|
 | `--dry-run` | Plan + route every file, write NOTHING. The preview gate — run this first on any real app. |
-| `--rollback <ISO-timestamp>` | Restore a prior backup batch (exact byte-for-byte). Accepts the raw ISO timestamp or the safe batch id. |
+| `--rollback <ISO-timestamp>` | Restore a prior backup batch (exact byte-for-byte) AND prune the restored files from the extract ledger + staged manifest so they are re-extractable (no stale `skipped-done`). Accepts the raw ISO timestamp or the safe batch id. |
 | `--stage-all` | Route every file to staging regardless of confidence (the cautious first pass — even high-confidence files stage). Backed by the engine (`extract … --stage-all`); a blocked file still stays inline-only (the audit gate wins over force-stage). |
 | `--apply-staged <file>` | Promote a previously-staged rewrite (the LIVE rel path, e.g. `src/components/Card.tsx`) from the staged mirror to live source, after the user reviewed it. Backed by the engine (`extract … --apply-staged <file>`): backup live (+ its collateral test) → write live → merge the staged catalog into the live catalog → ledger → drop the staged entry. Reversible by batch. |
 | `--phase <name>` | Run a single phase only (`extract` / `wire` / `translate` / `wire-to-locale` / `guard`). Default runs the whole loop. |
@@ -44,6 +44,8 @@ A file's routing confidence is the **most-cautious** of its included sites — o
 ## Backup + rollback (load-bearing order)
 
 Every auto-write batch creates a timestamped backup batch at `.vibe-lingual/localize/backup/<batchId>/` mirroring the source tree, with a `manifest.json` mapping each backup to its source. **The order is always: backup → write source → merge catalog → ledger entry.** A mutation that skipped the backup is the one bug the backup module exists to make impossible. `--rollback <timestamp>` restores every file in a batch to its exact original bytes (CRLF, trailing newlines, the original quote style — all verbatim). The codemod's recast pass normalizes formatting; rollback undoes that too.
+
+**Rollback also keeps engine state coherent.** Restoring a file to its pre-extract bytes makes the extract ledger's `written` entry a lie — left in place, the next extract would report `skipped-done` and silently refuse to re-localize the rolled-back file. So rollback **prunes the restored files from the extract ledger (and any staged-manifest entries)**; the return carries `ledgerPruned[]` / `stagedPruned[]`. As a belt-and-suspenders for out-of-band reverts (a `git checkout` or manual edit that never went through `--rollback`), extract re-verifies each ledger-`written` file against the source: if the next-intl markers (`useTranslations`/`getTranslations`/`useFormatter`/the `next-intl` import) are gone, the ledger entry is treated as stale and the file is re-extracted. A rolled-back file is always re-localizable.
 
 ## Workflow
 
@@ -103,7 +105,9 @@ Emit the two guards:
 
 Adding next-intl hooks to a component breaks its EXISTING tests — they now need a `NextIntlClientProvider` wrapper. This is **handled by the extract engine, not by hand** (the cowpath called it mechanical/automatable): for every auto-written component the engine discovers a co-located test (`<Base>.test.tsx` / `.spec.tsx`, sibling or under `__tests__/`), **backs it up INTO the same batch** (so `--rollback` returns the repo to a coherent pre-localize state — component AND test both restored), and provider-wraps it (`<NextIntlClientProvider locale="en" messages={{}} timeZone="UTC">` around each `render(...)`). The same happens on `--apply-staged` promotion.
 
-Read the run-report's `collateralTests[]` (per result) and `summary.collateralTests` / `collateralTestsWrapped` / `collateralTestsNeedManualWrap`. If `collateralTestsNeedManualWrap > 0`, the engine couldn't auto-wrap a test cleanly (no `render(<JSX>)` call found, or already wrapped) — those entries carry a `reason`; surface them so the user wraps them by hand. The test is still backed up either way, so rollback stays coherent. Fill real `messages` for the namespace when you know it (the engine leaves `messages={{}}`, which next-intl tolerates by echoing the key).
+The wrap is **per render call, not per file**: a test with N `render()` calls (one per `test()` block — the dominant React Testing Library pattern) gets ALL N wrapped, so no bare render of the now-i18n'd component is left to throw `No intl context found` and turn the suite red. The counts in `summary.collateralTestsWrapped` / `collateralTestsNeedManualWrap` are therefore render-call totals, and a per-edit `wrappedCount` / `needsManualWrap` is on each `testEdits[]` entry.
+
+Read the run-report's `collateralTests[]` (per result) and `summary.collateralTests` / `collateralTestsWrapped` / `collateralTestsNeedManualWrap`. If `collateralTestsNeedManualWrap > 0`, one or more `render()` calls took a **non-JSX argument** (`render(ui)`, `render(buildUI())`) the engine cannot wrap as JSX without breaking it — those calls are left intact and the edit's `reason` says so; surface them so the user wraps them by hand. A file can be BOTH changed (some renders wrapped) AND still report a manual count (others bare) — the banner must warn even when the file changed. The test is still backed up either way, so rollback stays coherent. Fill real `messages` for the namespace when you know it (the engine leaves `messages={{}}`, which next-intl tolerates by echoing the key).
 
 ### 10. Confirm + banner
 
