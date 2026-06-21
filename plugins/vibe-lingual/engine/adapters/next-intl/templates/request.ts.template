@@ -1,0 +1,27 @@
+import { cookies } from 'next/headers';
+import { getRequestConfig } from 'next-intl/server';
+import { UI_LOCALE_COOKIE } from './locale-cookie';
+
+// Only catalogs that actually exist in this hand-pass. Any other code (fr, de, …) falls back to
+// English rather than failing the dynamic import. The plugin grows this list as it generates catalogs.
+const AVAILABLE = __AVAILABLE__;
+
+export default getRequestConfig(async () => {
+  const store = await cookies();
+  const requested = store.get(UI_LOCALE_COOKIE)?.value;
+  const wanted = requested && AVAILABLE.includes(requested) ? requested : '__SOURCE_LOCALE__';
+
+  try {
+    return {
+      locale: wanted,
+      messages: (await import(`__MESSAGES_REL__/${wanted}.json`)).default,
+    };
+  } catch {
+    // Catalog not generated yet (or unreadable) — fall back to the source locale so a
+    // selected-but-missing locale never crashes the request. AVAILABLE is advisory, not load-bearing.
+    return {
+      locale: '__SOURCE_LOCALE__',
+      messages: (await import(`__MESSAGES_REL__/__SOURCE_LOCALE__.json`)).default,
+    };
+  }
+});

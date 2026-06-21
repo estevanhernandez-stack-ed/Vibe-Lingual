@@ -1,0 +1,19 @@
+// Single source of truth for the UI-locale cookie. request.ts (server) reads the name; the
+// settings layer (client) writes the value. No magic-string drift between the two halves.
+export const UI_LOCALE_COOKIE = '__COOKIE_NAME__';
+
+const COOKIE_RE = new RegExp('(?:^|;\\s*)' + UI_LOCALE_COOKIE + '=([^;]+)');
+
+/** Read the UI-locale cookie on the client. Returns null on the server or when unset. */
+export function getUiLocaleCookie(): string | null {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(COOKIE_RE);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+/** Write the UI-locale cookie on the client (1 year, path=/). No-op on the server. */
+export function setUiLocaleCookie(code: string): void {
+  if (typeof document === 'undefined') return;
+  const oneYear = 60 * 60 * 24 * 365;
+  document.cookie = `${UI_LOCALE_COOKIE}=${encodeURIComponent(code)}; path=/; max-age=${oneYear}; samesite=lax`;
+}

@@ -1,0 +1,23 @@
+// next-intl + use-intl + intl-messageformat + @formatjs all ship ESM-only and must be transformed
+// by SWC. next/jest's generated transformIgnorePatterns excludes everything under node_modules, so
+// the i18n libs break the existing suite on first run unless they are added to the allowlist.
+//
+// Replace a plain `module.exports = createJestConfig(customJestConfig)` with the async wrapper below
+// so the RESOLVED config can be post-processed (next/jest builds transformIgnorePatterns lazily).
+
+// next/jest generates its own transformIgnorePatterns; we need to post-process the resolved config
+// to add next-intl and use-intl (both ship ESM-only and must be transformed by SWC).
+const jestConfigFn = createJestConfig(customJestConfig)
+
+module.exports = async () => {
+  const config = await jestConfigFn()
+  // Inject next-intl + use-intl into every node_modules ignore pattern so SWC transforms them.
+  if (config.transformIgnorePatterns) {
+    config.transformIgnorePatterns = config.transformIgnorePatterns.map((p) =>
+      typeof p === 'string' && p.includes('node_modules')
+        ? p.replace('(?!(', '(?!(next-intl|use-intl|intl-messageformat|@formatjs|')
+        : p
+    )
+  }
+  return config
+}

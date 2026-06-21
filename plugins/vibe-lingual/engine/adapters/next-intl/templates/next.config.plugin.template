@@ -1,0 +1,4 @@
+import createNextIntlPlugin from "next-intl/plugin";
+
+// Explicit path: request config lives under src/.
+const withNextIntl = createNextIntlPlugin("__REQUEST_PATH__");

@@ -1,0 +1,17 @@
+// Add this import alongside the other root-layout imports:
+import { NextIntlClientProvider } from "next-intl";
+
+// Then wrap the existing <body> children in the provider. No props — the locale + messages
+// resolve from src/i18n/request.ts (server) via the createNextIntlPlugin wiring. The provider
+// reads the request-config result; passing locale/messages by hand here would duplicate that.
+//
+//   <body className="…">
+//     <NextIntlClientProvider>
+//       {/* …all existing children, unchanged… */}
+//     </NextIntlClientProvider>
+//   </body>
+//
+// One-render cookie lag (documented, not a bug): on the very first paint after a fresh login the
+// UI-locale cookie is set client-side and is not yet on the initial SSR pass, so chrome can render
+// one frame in the source locale before the cookie-driven refresh lands. Subsequent navigations are
+// correct. See the wiring notes.

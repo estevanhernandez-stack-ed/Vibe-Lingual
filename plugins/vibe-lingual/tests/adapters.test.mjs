@@ -163,9 +163,16 @@ describe('stubs — declared but inert (no mutation surface)', () => {
   });
 });
 
-describe('next-intl adapter — mutating methods are TODO (M6/M7), throw if called early', () => {
-  test('wire() throws the M6 marker', () => {
-    expect(() => nextIntlAdapter.wire({})).toThrow(/M6/);
+describe('next-intl adapter — wire() implemented (M6); transform et al TODO (M7)', () => {
+  test('wire() is implemented — returns a WiredFileSet, does not throw', () => {
+    const set = nextIntlAdapter.wire({});
+    expect(set).toMatchObject({
+      files: expect.any(Array),
+      patches: expect.any(Array),
+      notes: expect.any(Array),
+    });
+    expect(set.files.length).toBeGreaterThan(0);
+    expect(set.patches.length).toBeGreaterThan(0);
   });
 
   test('transform / emitParityTest / emitGuard throw the M7 marker', () => {

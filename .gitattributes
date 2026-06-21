@@ -1,0 +1,8 @@
+# vibe-lingual emits framework wiring files modeled BYTE-FOR-BYTE on the proven
+# Celestia3 cowpath (LF line endings). The next-intl adapter reads these templates
+# with readFileSync('utf8') and substitutes placeholders, so the working-copy line
+# endings ARE the emitted line endings. Force LF on checkout (regardless of
+# core.autocrlf) or a CRLF working copy would silently break the byte-for-byte
+# parity guarantee on Windows clones.
+plugins/vibe-lingual/engine/adapters/next-intl/templates/** text eol=lf
+plugins/vibe-lingual/engine/**/*.mjs text eol=lf
