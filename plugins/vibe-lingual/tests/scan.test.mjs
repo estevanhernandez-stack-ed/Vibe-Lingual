@@ -106,6 +106,79 @@ describe('scan — (i-b) bare machine-locale date-key in a component is STRUCTUR
 });
 
 // ---------------------------------------------------------------------------
+// (i-c) RUNTIME-TIMEZONE IDIOM — `Intl.DateTimeFormat().resolvedOptions().timeZone`
+// (and the argument-less `Intl.DateTimeFormat()` family) produces a tz STRING FOR
+// LOGIC, never display copy. The old classifier hardcoded hasFormatToParts=false,
+// had NO `.resolvedOptions()` detection, and let a no-locale-arg
+// `Intl.DateTimeFormat()` in a .tsx fall through every structural branch to
+// {structural:false} — emitted INCLUDED. On Celestia3 this re-flagged
+// TransitFeed.tsx:352, which sits INSIDE an already-extracted next-intl
+// `format.dateTime(...)` formatter (a cowpath-localized surface), violating the
+// M2 regression oracle ('the 4 already-localized surfaces are NOT re-flagged').
+// The idiom appears 3x in real Celestia3 source.
+// ---------------------------------------------------------------------------
+describe('scan — (i-c) runtime-timezone Intl idiom is STRUCTURAL, not included', () => {
+  const tf = at('date-intl').filter((s) => s.file.includes('TransitFeed'));
+
+  test('both Intl.DateTimeFormat().resolvedOptions() calls are flagged structuralIntl + excluded', () => {
+    const ro = tf.filter((s) => /resolvedOptions|argument-less/.test(s.excludedReason || ''));
+    expect(ro.length).toBe(2);
+    for (const s of ro) {
+      expect(s.structuralIntl).toBe(true);
+      expect(s.excluded).toBe(true);
+      expect(s.confidence).toBe('low');
+      expect(s.excludedReason).toMatch(/resolvedOptions|argument-less/);
+    }
+  });
+
+  test('the in-JSX resolvedOptions site is excluded DESPITE living inside JSX (regression oracle)', () => {
+    // The one inside format.dateTime(...) is in the JSX tree — proves the new
+    // branch fires regardless of insideJsx, so the extracted formatter is not
+    // re-flagged.
+    const inJsx = tf.filter((s) => s.structuralIntl && s.excluded);
+    expect(inJsx.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('the runtime-timezone idiom never inflates TransitFeed density', () => {
+    const row = inventory.componentsByDensity.find((c) => c.file.includes('TransitFeed'));
+    const includedInFile = included.filter((s) => s.file.includes('TransitFeed')).length;
+    if (row) expect(row.count).toBe(includedInFile);
+    // none of the excluded TransitFeed date sites are counted in density
+    expect(tf.filter((s) => s.excluded).every((s) => true)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (i-d) SECONDARY INTL LEAK — a bare-locale `toLocale*String([], {...})` whose
+// result is assigned to a const and interpolated into a NON-JSX template literal
+// (an LLM-prompt context string) is structural string-build machinery, not
+// display copy. KTD-5's machine-locale branch only fired with a MACHINE locale
+// arg present; the no-locale, not-in-JSX case slipped through as presentational.
+// Celestia3 evidence: CosmicInsightPanel.tsx:91 (`toLocaleTimeString([], {...})`
+// → `timeString` → `${timeString}` inside a backtick prompt string).
+// ---------------------------------------------------------------------------
+describe('scan — (i-d) bare-locale toLocale*String consumed by a non-JSX template is STRUCTURAL', () => {
+  const tf = at('date-intl').filter((s) => s.file.includes('TransitFeed'));
+
+  test('the toLocaleTimeString([], ...) → timeString → template site is excluded', () => {
+    // the bare-locale toLocale* site carries the "Intl date" label (no localeArg)
+    // and a structural exclusion reason naming the non-JSX template/string-build.
+    const leak = tf.find((s) => s.excluded && /template\/string-build/.test(s.excludedReason || ''));
+    expect(leak).toBeDefined();
+    expect(leak.structuralIntl).toBe(true);
+    expect(leak.confidence).toBe('low');
+  });
+
+  test('a presentational date IS still distinguished from the template-consumed one', () => {
+    // Notices.tsx ReadingDate renders an en-US date in JSX — that stays INCLUDED.
+    const presentational = at('date-intl').find((s) => s.file.includes('Notices'));
+    expect(presentational).toBeDefined();
+    expect(presentational.structuralIntl).toBe(false);
+    expect(presentational.excluded).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // (iv-b) developer-facing invariant Error messages are NOT captured as toasts.
 // The dogfood OVER-CAPTURED three hook-provider guards
 // ('useAuth must be used within an AuthProvider', etc.) as localizable toast

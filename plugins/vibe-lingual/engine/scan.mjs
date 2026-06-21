@@ -330,7 +330,31 @@ function siteConfidence(kind, text) {
 
 const MACHINE_LOCALE_RE = /^en-(CA|US|GB)$|^sv-SE$|^fr-CA$/;
 
-function classifyIntlSite({ localeArg, hasTimeZoneOpt, hasFormatToParts, inComponentFile, insideJsx }) {
+function classifyIntlSite({
+  localeArg,
+  hasTimeZoneOpt,
+  hasFormatToParts,
+  inComponentFile,
+  insideJsx,
+  resolvedOptionsConsumer,
+  argless,
+  bareLocaleNotInJsx,
+}) {
+  // RUNTIME-TIMEZONE IDIOM (the dogfood miss): a `.resolvedOptions()`-chained or
+  // argument-less `Intl.DateTimeFormat()` produces a tz string for LOGIC, never
+  // display copy — `Intl.DateTimeFormat().resolvedOptions().timeZone` reads the
+  // runtime zone to feed a formatter's `timeZone` option or a prompt-context
+  // string. It is structural regardless of where it sits (it appears inside
+  // `format.dateTime(...)` in JSX on Celestia3's TransitFeed.tsx:352, and in a
+  // non-JSX prompt string on CosmicInsightPanel.tsx:97 / lib/pushClient.ts).
+  // There is no locale arg and no display output to extract — wrapping it in a
+  // t() would be meaningless and would break the zone read.
+  if (resolvedOptionsConsumer) {
+    return { structural: true, reason: 'Intl.DateTimeFormat().resolvedOptions() — runtime timeZone read (logic, not display)' };
+  }
+  if (argless) {
+    return { structural: true, reason: 'argument-less Intl.DateTimeFormat() — runtime/default zone read (logic, not display)' };
+  }
   // tz-offset math: a fixed machine locale + an explicit timeZone option, or a
   // formatToParts consumer → structural.
   if (hasFormatToParts) return { structural: true, reason: 'formatToParts consumer (locale-invariant parsing)' };
@@ -347,6 +371,17 @@ function classifyIntlSite({ localeArg, hasTimeZoneOpt, hasFormatToParts, inCompo
   // regardless of timeZone presence whenever the result is not in the JSX tree.
   if (localeArg && MACHINE_LOCALE_RE.test(localeArg) && !insideJsx) {
     return { structural: true, reason: 'fixed machine locale, not rendered in JSX (date-key logic, not display)' };
+  }
+  // SECONDARY INTL LEAK (same classifier gap): a no-machine-locale `toLocale*String`
+  // — bare `[]` locale or no locale arg — whose result is assigned to a const and
+  // consumed by a template literal / string-build that is NOT rendered in JSX is
+  // presentational ONLY by appearance. On Celestia3 CosmicInsightPanel.tsx:91,
+  // `birthDateObj.toLocaleTimeString([], {...})` is bound to `timeString`, then
+  // `${timeString}` is interpolated into a backtick LLM-prompt context string —
+  // machinery for the model, not chrome for the user. 'Rendered in JSX' is the
+  // discriminator: a const consumed by a non-JSX template build is structural.
+  if (bareLocaleNotInJsx) {
+    return { structural: true, reason: 'bare-locale toLocale*String consumed by a non-JSX template/string-build (logic, not display)' };
   }
   // a date formatter in a non-component lib/util file, not rendered in JSX → structural by location.
   if (!inComponentFile && !insideJsx) {
@@ -440,6 +475,68 @@ function lineOf(node) {
   return node && node.loc ? node.loc.start.line : 0;
 }
 
+// A locale arg is "bare" (no MACHINE locale that forces a stable ISO/normalized
+// string) when it is absent, an empty array `[]`, `undefined`, or a string that
+// is NOT a machine locale. The bare `[]` form (`toLocaleTimeString([], {...})`)
+// is the Celestia3 CosmicInsightPanel.tsx:91 shape — it asks for the runtime
+// default locale, not a normalization locale.
+function isBareLocaleArg(arg) {
+  if (arg == null) return true; // no locale arg at all
+  if (arg.type === 'ArrayExpression' && arg.elements.length === 0) return true; // []
+  if (arg.type === 'Identifier' && arg.name === 'undefined') return true;
+  const v = stringLiteralValue(arg);
+  if (v != null) return !MACHINE_LOCALE_RE.test(v); // a non-machine string locale is still "bare" for normalization purposes
+  // a variable/spread locale arg → treat as bare (we cannot prove it normalizes)
+  return true;
+}
+
+// Pre-pass over a file's AST: find const/let names that are (a) bound to a
+// bare-locale `toLocale*String(...)` call AND (b) referenced as an interpolation
+// inside a `TemplateLiteral` that is NOT within a JSX tree. Such a const is a
+// machinery/string-build value (e.g. an LLM-prompt context line), not display
+// copy — even though `toLocale*String` superficially looks presentational. This
+// is the discriminator the finding asks for: 'rendered in JSX' vs 'consumed by a
+// const → template/string-build'.
+function bareLocaleTemplateConsts(ast) {
+  const boundToBareLocale = new Map(); // name → declarator init node (the toLocale* call)
+  const referencedInNonJsxTemplate = new Set();
+
+  visit(ast.program, null, { insideJsx: false, insideTranslationCall: false }, (node, parent, ctx) => {
+    // (a) const X = <expr>.toLocale*String(<bare locale>, ...)
+    if (
+      node.type === 'VariableDeclarator' &&
+      node.id &&
+      node.id.type === 'Identifier' &&
+      node.init &&
+      node.init.type === 'CallExpression' &&
+      node.init.callee &&
+      node.init.callee.type === 'MemberExpression' &&
+      node.init.callee.property &&
+      INTL_DATE_METHODS.has(node.init.callee.property.name)
+    ) {
+      const args = node.init.arguments || [];
+      if (isBareLocaleArg(args[0])) {
+        boundToBareLocale.set(node.id.name, node.init);
+      }
+    }
+
+    // (b) an Identifier interpolated inside a TemplateLiteral that is NOT in JSX.
+    // TemplateLiteral.expressions holds the `${...}` slots; a bare Identifier
+    // there is a string-build consumer.
+    if (node.type === 'TemplateLiteral' && !ctx.insideJsx) {
+      for (const expr of node.expressions || []) {
+        if (expr && expr.type === 'Identifier') referencedInNonJsxTemplate.add(expr.name);
+      }
+    }
+  });
+
+  const result = new Map(); // toLocale* call node → true (lookup by node identity)
+  for (const [name, callNode] of boundToBareLocale) {
+    if (referencedInNonJsxTemplate.has(name)) result.set(callNode, true);
+  }
+  return result;
+}
+
 function scanFile(absPath, relPosix, text) {
   const sites = [];
   let ast;
@@ -451,6 +548,10 @@ function scanFile(absPath, relPosix, text) {
 
   const inComponentFile = /\.(tsx|jsx)$/.test(relPosix);
   const namespace = componentNamespace(relPosix);
+
+  // Pre-pass: which bare-locale toLocale*String calls feed a non-JSX template
+  // build (structural string-build, not display). Keyed by call-node identity.
+  const bareLocaleTemplate = bareLocaleTemplateConsts(ast);
 
   visit(ast.program, null, { insideJsx: false, insideTranslationCall: false }, (node, parent, ctx) => {
     // ----- JSX text -----
@@ -517,7 +618,7 @@ function scanFile(absPath, relPosix, text) {
         callee.property.name === 'DateTimeFormat';
       // also new Intl.DateTimeFormat handled below in NewExpression
       if (isIntlDTF) {
-        pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx);
+        pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx, { parent, bareLocaleTemplate });
       }
 
       // ----- date.toLocale*String(...) -----
@@ -526,7 +627,7 @@ function scanFile(absPath, relPosix, text) {
         callee.property &&
         INTL_DATE_METHODS.has(callee.property.name)
       ) {
-        pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx, { isToLocale: true });
+        pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx, { isToLocale: true, parent, bareLocaleTemplate });
       }
       return;
     }
@@ -543,7 +644,7 @@ function scanFile(absPath, relPosix, text) {
         callee.property &&
         callee.property.name === 'DateTimeFormat'
       ) {
-        pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx);
+        pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx, { parent, bareLocaleTemplate });
       }
     }
   });
@@ -567,6 +668,40 @@ function pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx, op
       if (keyName === 'timeZone') hasTimeZoneOpt = true;
     }
   }
+
+  const isIntlDTF =
+    (node.type === 'CallExpression' || node.type === 'NewExpression') &&
+    node.callee &&
+    node.callee.type === 'MemberExpression' &&
+    node.callee.object &&
+    node.callee.object.type === 'Identifier' &&
+    node.callee.object.name === 'Intl' &&
+    node.callee.property &&
+    node.callee.property.name === 'DateTimeFormat';
+
+  // RUNTIME-TIMEZONE IDIOM detection.
+  //   resolvedOptionsConsumer: this Intl.DateTimeFormat() call is the OBJECT of a
+  //     `.resolvedOptions()` member access — `Intl.DateTimeFormat().resolvedOptions()
+  //     .timeZone`. The parent is a MemberExpression whose property is
+  //     `resolvedOptions`. (Celestia3 TransitFeed.tsx:352 / CosmicInsightPanel.tsx:97
+  //     / lib/pushClient.ts:23.) This reads the zone for logic, never display.
+  //   argless: an `Intl.DateTimeFormat()` with zero arguments — same family
+  //     (runtime/default-zone read); no locale, no display output to extract.
+  const parent = opts.parent;
+  const resolvedOptionsConsumer =
+    isIntlDTF &&
+    parent &&
+    parent.type === 'MemberExpression' &&
+    parent.object === node &&
+    parent.property &&
+    parent.property.name === 'resolvedOptions';
+  const argless = isIntlDTF && args.length === 0;
+
+  // SECONDARY INTL LEAK: this exact toLocale*String node was pre-identified as a
+  // bare-locale call whose result feeds a non-JSX template/string-build.
+  const bareLocaleTemplate = opts.bareLocaleTemplate;
+  const bareLocaleNotInJsx = !!(bareLocaleTemplate && bareLocaleTemplate.has(node));
+
   // detect a .formatToParts consumer on the same expression (parent member chain)
   const hasFormatToParts = false; // conservative: only set via explicit member detection below
 
@@ -576,6 +711,9 @@ function pushIntlSite(sites, node, relPosix, namespace, inComponentFile, ctx, op
     hasFormatToParts,
     inComponentFile,
     insideJsx: ctx.insideJsx,
+    resolvedOptionsConsumer,
+    argless,
+    bareLocaleNotInJsx,
   });
 
   const label = localeArg ? `Intl date (${localeArg})` : 'Intl date';
