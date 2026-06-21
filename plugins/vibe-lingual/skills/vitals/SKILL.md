@@ -97,7 +97,7 @@ first-run-setup    session-logger    friction-logger    evolve-lingual
 
 ### Check #8 — Engine test suite present + green
 
-**Read** the `tests/` directory; confirm the core suites exist (`detect`, `scan`, `audit`, `adapters`, `wire`, `transform`, `guard`, `parity`, `backup`, `extract`, `extract-dogfood-defects`). If the run is from the plugin repo with devDeps installed, optionally run `npm test` and capture the pass/fail totals. **Report:** ✓ pass `<N> suites present` (and `<T> tests green` when run); ⚠ warn if a core suite file is absent; ✗ fail if `npm test` was run and any test failed (surface the failing suite name). When devDeps are not installed, this check is presence-only — note it.
+**Read** the `tests/` directory; confirm the core suites exist (`detect`, `scan`, `audit`, `adapters`, `wire`, `transform`, `guard`, `parity`, `backup`, `extract`, `extract-dogfood-defects`). If the run is from the plugin repo with devDeps installed, optionally run `npm test` (never bare `npx jest` — the suites are native-ESM `.mjs` and need the `--experimental-vm-modules` flag the `npm test` script sets; `npx jest` reports a false "Cannot use import statement outside a module" failure) and capture the pass/fail totals. **Report:** ✓ pass `<N> suites present` (and `<T> tests green` when run); ⚠ warn if a core suite file is absent; ✗ fail if `npm test` was run and any test failed (surface the failing suite name). When devDeps are not installed, this check is presence-only — note it.
 
 ## Output Format
 

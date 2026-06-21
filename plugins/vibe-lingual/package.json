@@ -17,11 +17,13 @@
   "scripts": {
     "test": "node --experimental-vm-modules --disable-warning=ExperimentalWarning node_modules/jest/bin/jest.js --passWithNoTests"
   },
+  "dependencies": {
+    "@babel/parser": "^7.24.0",
+    "jscodeshift": "^0.15.2"
+  },
   "devDependencies": {
     "@babel/core": "^7.24.0",
-    "@babel/parser": "^7.24.0",
-    "jest": "^29.7.0",
-    "jscodeshift": "^0.15.2"
+    "jest": "^29.7.0"
   },
   "engines": {
     "node": ">=20.0.0"
