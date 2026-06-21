@@ -1,0 +1,6 @@
+{
+  "name": "audit-app-fixture",
+  "private": true,
+  "scripts": { "dev": "next dev --turbo" },
+  "dependencies": { "next": "16.0.0", "react": "19.0.0", "firebase-admin": "12.0.0" }
+}
