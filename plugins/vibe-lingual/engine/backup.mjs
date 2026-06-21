@@ -31,6 +31,7 @@ import {
   existsSync,
   readdirSync,
   statSync,
+  rmSync,
 } from 'node:fs';
 import { join, dirname, relative, sep } from 'node:path';
 
@@ -90,6 +91,11 @@ export class BackupBatch {
     this.batchId = batchId;
     this.dir = join(appRoot, BACKUP_ROOT, batchId);
     this.files = []; // [{ source: relPosix, backup: relPosix-under-batch }]
+    // catalog files this batch CREATED (did not exist pre-write). A backup can
+    // only restore a file that existed before — a created catalog has no prior
+    // bytes to revert to, so rollback DELETES it instead, leaving no dangling
+    // namespace catalog after a revert (the MINOR fix). Stored as rel POSIX paths.
+    this.createdCatalogs = [];
     this._created = false;
   }
 
@@ -121,10 +127,19 @@ export class BackupBatch {
     return backupRel;
   }
 
+  // Record a catalog file the batch CREATED (no prior bytes). rollback deletes
+  // these after restoring sources so a revert leaves no orphan namespace catalog
+  // (e.g. messages/en/PushOptInPrompt.json the run created). Idempotent per path.
+  recordCreatedCatalog(relPath) {
+    const relPosix = toPosix(relPath);
+    if (!this.createdCatalogs.includes(relPosix)) this.createdCatalogs.push(relPosix);
+    return relPosix;
+  }
+
   // Write the batch manifest. Call once after all backupFile calls. A batch that
-  // backed up zero files writes no manifest + leaves no dir (nothing to restore).
+  // backed up zero files AND created no catalog writes no manifest + leaves no dir.
   commit(extra = {}) {
-    if (this.files.length === 0) return null;
+    if (this.files.length === 0 && this.createdCatalogs.length === 0) return null;
     this._ensureDir();
     const manifest = {
       schemaVersion: 1,
@@ -132,6 +147,8 @@ export class BackupBatch {
       createdAt: new Date().toISOString(),
       appRoot: this.appRoot,
       files: this.files.map((f) => ({ source: f.source, backup: f.backup })),
+      // catalogs the run created — rollback removes these (no prior bytes to restore).
+      createdCatalogs: this.createdCatalogs.slice(),
       ...extra,
     };
     writeFileSync(
@@ -258,6 +275,27 @@ export function rollback(appRoot, batchIdOrIso) {
     restored.push(entry.source);
   }
 
+  // remove catalogs the batch CREATED (MINOR): a created catalog has no prior
+  // bytes to restore — rollback that restored ONLY the source would leave a
+  // dangling namespace catalog (an orphan messages/<locale>/<NS>.json the revert
+  // never planted). Delete each so the revert is clean. Best-effort: an already-
+  // gone or unremovable file is reported under catalogsMissing, never throws.
+  const catalogsRemoved = [];
+  const catalogsMissing = [];
+  for (const rel of manifest.createdCatalogs || []) {
+    const abs = join(appRoot, rel);
+    if (!existsSync(abs)) {
+      catalogsMissing.push(rel);
+      continue;
+    }
+    try {
+      rmSync(abs);
+      catalogsRemoved.push(rel);
+    } catch {
+      catalogsMissing.push(rel);
+    }
+  }
+
   // coherence: prune the RESTORED files from the extract ledger + staged manifest
   // so the next extract run does not report `skipped-done` on a rolled-back file.
   // Only the files we actually reverted are pruned (a missing backup left its
@@ -270,6 +308,8 @@ export function rollback(appRoot, batchIdOrIso) {
     batchId,
     restored,
     missing,
+    catalogsRemoved,
+    catalogsMissing,
     ledgerPruned,
     stagedPruned,
     error: missing.length > 0 ? `${missing.length} backup file(s) missing — partial restore` : undefined,

@@ -35,6 +35,7 @@ import {
   existsSync,
   renameSync,
   rmSync,
+  statSync,
 } from 'node:fs';
 import { join, dirname, sep } from 'node:path';
 import jscodeshiftDefault from 'jscodeshift';
@@ -145,33 +146,63 @@ function sourceStillExtracted(source) {
 // restores the component but leaves the test provider-wrapped — an incoherent
 // repo state the engine claims is "restored exactly").
 //
-// Conventions probed (relative to the component's rel path), first match wins per
-// extension: a sibling `<base>.test.<ext>` / `<base>.spec.<ext>`, or a
-// `__tests__/<base>.test.<ext>` / `__tests__/<base>.spec.<ext>` next to it. We
-// return ALL matches (a component can carry both a .test and a .spec) as rel paths.
+// Conventions probed (relative to the component's rel path):
+//   1. a SIBLING `<base>.test|spec.<ext>` next to the component.
+//   2. a `__tests__/<base>.test|spec.<ext>` in the component's OWN dir.
+//   3. a `<ancestor>/__tests__/<base>.test|spec.<ext>` for every ancestor dir up
+//      to (and including) the app root — the project-root `src/__tests__/`
+//      convention Celestia3 uses for its 93 suites (DEFECT 2). A component at
+//      src/components/Foo.tsx finds its test at src/__tests__/Foo.test.tsx so the
+//      NextIntlClientProvider wrap fires there too, not just on co-located tests.
+// We return ALL matches (a component can carry both a .test and a .spec, and a
+// sibling AND a root-__tests__ test) as rel POSIX paths, de-duplicated.
 // ---------------------------------------------------------------------------
 
 const TEST_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js'];
+
+// Every directory from the component's own dir up to the app root, inclusive.
+// '' (the app root itself) is included so a top-level __tests__/ is probed too.
+// Defensive against a relPath that escapes the root (../) — stop at '.'/''.
+function ancestorDirs(relDir) {
+  const dirs = [];
+  let cur = relDir === '.' ? '' : relDir;
+  // walk up using POSIX-normalized segments so Windows separators don't leak.
+  let guard = 0;
+  while (guard++ < 64) {
+    dirs.push(cur);
+    if (cur === '' || cur === '.') break;
+    const parent = dirname(cur);
+    if (parent === cur) break; // root reached
+    cur = parent === '.' ? '' : parent;
+  }
+  return dirs;
+}
 
 function findCollateralTests(appRoot, relPath) {
   const dir = dirname(relPath); // posix-ish; join handles separators
   // strip the component's own extension to get the base name.
   const file = relPath.slice(dir.length + 1);
   const base = file.replace(/\.(tsx|ts|jsx|js)$/i, '');
+
   const candidates = [];
   for (const kind of ['test', 'spec']) {
     for (const ext of TEST_EXTENSIONS) {
+      // 1. sibling next to the component.
       candidates.push(join(dir, `${base}.${kind}.${ext}`));
-      candidates.push(join(dir, '__tests__', `${base}.${kind}.${ext}`));
+      // 2 + 3. a __tests__/ at the component's dir AND every ancestor up to root.
+      for (const anc of ancestorDirs(dir)) {
+        candidates.push(join(anc, '__tests__', `${base}.${kind}.${ext}`));
+      }
     }
   }
+
   const found = [];
   const seen = new Set();
   for (const rel of candidates) {
     const posix = rel.split(sep).join('/');
     if (seen.has(posix)) continue;
+    seen.add(posix);
     if (existsSync(join(appRoot, rel))) {
-      seen.add(posix);
       found.push(posix);
     }
   }
@@ -307,13 +338,123 @@ function wrapTestWithProvider(source) {
 
 // ---------------------------------------------------------------------------
 // catalog merge — NEVER lose a key. Read the existing namespaced catalog (if
-// any), deep-merge the new keys under the namespace, write atomically (temp +
-// rename). The catalog shape mirrors the cowpath: messages/<locale>/<NS>.json
-// holds the flat key→text map for one namespace (split-by-namespace layout).
+// any), deep-merge the new keys, write atomically (temp + rename).
+//
+// TWO LAYOUTS, MATCH THE APP'S EXISTING ONE (DEFECT 1 — the Celestia3 dogfood
+// gap). next-intl can load either:
+//
+//   SPLIT      messages/<locale>/<NS>.json   — one file per namespace, holding a
+//              flat key→text map. (The plugin's no-catalog default.)
+//   FLAT       messages/<locale>.json        — ONE file per locale, keyed by
+//              namespace at the top level: { "<NS>": { key: text } }. This is the
+//              cowpath/Celestia3 shape AND exactly what the wired request.ts
+//              template imports (`messages/${wanted}.json`).
+//
+// The request config the adapter wires (wire.mjs → request.ts.template) imports
+// the FLAT file. So on an app already wired flat, writing a parallel SPLIT
+// messages/<locale>/<NS>.json produces a catalog request.ts never reads — the
+// t() keys resolve to MISSING_MESSAGE at runtime. The fix: detect the app's
+// existing layout and write INTO it. Only default to SPLIT when no catalog
+// exists for the locale yet (preserves the from-scratch shape + every test).
+//
+// detectCatalogLayout returns:
+//   'flat'  — a messages/<locale>.json file exists.
+//   'split' — a messages/<locale>/ directory exists.
+//   null    — neither; the caller picks the default (split).
+// FLAT WINS when both somehow exist (the wired request.ts reads the flat file;
+// honor what the runtime actually loads).
 // ---------------------------------------------------------------------------
 
-function catalogPath(appRoot, messagesDir, locale, namespace) {
+// app-root-relative POSIX path for an absolute path under the root. Used for the
+// backup API (which joins appRoot) and for reporting catalog paths consistently
+// with the staged manifest (which already stores rel paths).
+function relToRoot(appRoot, absPath) {
+  let rel = absPath.startsWith(appRoot) ? absPath.slice(appRoot.length) : absPath;
+  return rel.replace(/^[/\\]+/, '').split(sep).join('/').split('\\').join('/');
+}
+
+function flatCatalogPath(appRoot, messagesDir, locale) {
+  return join(appRoot, messagesDir, `${locale}.json`);
+}
+
+function splitCatalogPath(appRoot, messagesDir, locale, namespace) {
   return join(appRoot, messagesDir, locale, `${namespace}.json`);
+}
+
+function detectCatalogLayout(appRoot, messagesDir, locale) {
+  const flat = flatCatalogPath(appRoot, messagesDir, locale);
+  const splitDir = join(appRoot, messagesDir, locale);
+  if (existsSync(flat)) return 'flat';
+  if (existsSync(splitDir)) {
+    try {
+      if (statSync(splitDir).isDirectory()) return 'split';
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}
+
+// Resolve the catalog target for a (locale, namespace), honoring the app's
+// existing layout. Returns { layout, absPath } where:
+//   layout 'flat'  → absPath = messages/<locale>.json (keys merge UNDER namespace)
+//   layout 'split' → absPath = messages/<locale>/<NS>.json (keys merge flat)
+function resolveCatalogTarget(appRoot, messagesDir, locale, namespace) {
+  const layout = detectCatalogLayout(appRoot, messagesDir, locale) || 'split';
+  const absPath =
+    layout === 'flat'
+      ? flatCatalogPath(appRoot, messagesDir, locale)
+      : splitCatalogPath(appRoot, messagesDir, locale, namespace);
+  return { layout, absPath };
+}
+
+// Layout-aware catalog merge. For SPLIT it is the plain key→text mergeCatalog.
+// For FLAT it scopes the keys under the namespace inside the per-locale file:
+// the flat file holds { "<NS>": { key: text }, "<OtherNS>": {...} }, so the
+// merge reads the existing file, deep-merges the new keys under just THIS
+// namespace (sibling namespaces untouched), and writes atomically. Existing
+// keys win unless overwrite is set — same never-clobber-a-human-edit contract.
+// Returns { added, kept, total, path, layout }.
+function mergeCatalogForLayout(absPath, layout, namespace, keys, opts = {}) {
+  if (layout !== 'flat') {
+    return { ...mergeCatalog(absPath, keys, opts), layout: 'split' };
+  }
+  const { overwrite = false } = opts;
+  let existing = {};
+  if (existsSync(absPath)) {
+    try {
+      existing = JSON.parse(readFileSync(absPath, 'utf8')) || {};
+    } catch {
+      existing = {};
+    }
+  }
+  // the namespace sub-object inside the flat file (preserve sibling namespaces).
+  const nsExisting =
+    existing[namespace] && typeof existing[namespace] === 'object' && !Array.isArray(existing[namespace])
+      ? existing[namespace]
+      : {};
+  const nsMerged = { ...nsExisting };
+  let added = 0;
+  let kept = 0;
+  for (const [k, v] of Object.entries(keys || {})) {
+    if (Object.prototype.hasOwnProperty.call(nsMerged, k)) {
+      kept += 1;
+      if (overwrite) nsMerged[k] = v;
+    } else {
+      nsMerged[k] = v;
+      added += 1;
+    }
+  }
+  // stable key order within the namespace for a clean diff.
+  const nsOrdered = {};
+  for (const k of Object.keys(nsMerged).sort()) nsOrdered[k] = nsMerged[k];
+  // rebuild the file with namespaces in sorted order, our namespace's keys sorted.
+  const merged = { ...existing, [namespace]: nsOrdered };
+  const ordered = {};
+  for (const ns of Object.keys(merged).sort()) ordered[ns] = merged[ns];
+  writeJsonAtomic(absPath, ordered);
+  // total = keys under THIS namespace (the unit a localize run reasons about).
+  return { added, kept, total: Object.keys(nsOrdered).length, path: absPath, layout: 'flat' };
 }
 
 // Atomic JSON write: write to <path>.tmp then rename over <path>. rename is atomic
@@ -558,7 +699,20 @@ export function extract(inventory, options = {}) {
     }
 
     const namespace = out.namespace;
-    const catAbs = catalogPath(appRoot, messagesDir, sourceLocale, namespace);
+    // Resolve the catalog target against the app's EXISTING layout (DEFECT 1):
+    // a flat messages/<locale>.json gets keys merged UNDER the namespace; a split
+    // messages/<locale>/ keeps the per-namespace file; no catalog yet → split
+    // default. The wired request.ts loads the flat file, so writing split on a
+    // flat-wired app yields MISSING_MESSAGE — this resolver closes that gap.
+    const { layout: catalogLayout, absPath: catAbs } = resolveCatalogTarget(
+      appRoot,
+      messagesDir,
+      sourceLocale,
+      namespace,
+    );
+    // app-root-RELATIVE catalog path (POSIX) — what the backup API + the reported
+    // result/ledger fields want (catAbs is absolute; never feed it to backupFile).
+    const catRelToRoot = relToRoot(appRoot, catAbs);
 
     // Co-located tests for this component — discovered once, surfaced on EVERY
     // route so the SKILL/agent can never silently leave a suite red. On auto-write
@@ -576,7 +730,8 @@ export function extract(inventory, options = {}) {
         reason: 'low file confidence — suggestion only; no source/catalog written',
         changed: true,
         keys: out.keys,
-        catalog: catAbs.split(sep).join('/'),
+        catalog: catRelToRoot,
+        catalogLayout,
         backupPath: null,
         collateralTests,
       });
@@ -590,17 +745,28 @@ export function extract(inventory, options = {}) {
       // absolute path stored here breaks join on Windows). The live catalog rel is
       // derived the same way so promotion knows where to merge keys back.
       const relStagedSource = join(STAGED_DIR, file).split(sep).join('/');
+      // the staged catalog MIRROR is always a split per-namespace file under the
+      // staged dir — it is a private key store the promotion reads back, never the
+      // app's live layout. The LIVE catalog path + layout are resolved against the
+      // app's existing shape (DEFECT 1) so promotion merges into what request.ts
+      // actually loads (flat messages/<locale>.json under a namespace, or split).
       const relStagedCatalog = join(STAGED_DIR, messagesDir, sourceLocale, `${namespace}.json`)
         .split(sep)
         .join('/');
-      const relLiveCatalog = join(messagesDir, sourceLocale, `${namespace}.json`).split(sep).join('/');
+      const { layout: liveLayout, absPath: liveCatalogAbs } = resolveCatalogTarget(
+        appRoot,
+        messagesDir,
+        sourceLocale,
+        namespace,
+      );
+      const relLiveCatalog = relToRoot(appRoot, liveCatalogAbs);
       const stagedSourceAbs = join(appRoot, relStagedSource);
       const stagedCatalogAbs = join(appRoot, relStagedCatalog);
       if (!dryRun) {
         mkdirSync(dirname(stagedSourceAbs), { recursive: true });
         writeFileSync(stagedSourceAbs, out.code, 'utf8');
         // staged catalog is a fresh merge against any prior staged catalog (NOT the
-        // live one — staging never touches live state).
+        // live one — staging never touches live state). Always split in the mirror.
         mergeCatalog(stagedCatalogAbs, out.keys, { overwrite: overwriteKeys });
         // record the read-back contract so `--apply-staged <file>` can promote
         // this rewrite without re-scanning / re-running the codemod.
@@ -609,6 +775,7 @@ export function extract(inventory, options = {}) {
           stagedSource: relStagedSource,
           stagedCatalog: relStagedCatalog,
           liveCatalog: relLiveCatalog,
+          liveLayout,
           namespace,
           messagesDir,
           sourceLocale,
@@ -669,14 +836,29 @@ export function extract(inventory, options = {}) {
             : `not auto-wrapped (${wrap.reason}) — wrap manually`,
         });
       }
+      // back up the live catalog BEFORE the merge IF it already exists — so a
+      // rollback restores a pre-existing flat/split catalog to its exact prior
+      // bytes (the merge mutates it). A catalog the run CREATES is not backed up
+      // (there is nothing to restore TO); rollback removes those created files
+      // instead (see backup.mjs createdCatalogs handling). The backup/record API
+      // takes an app-root-RELATIVE path, so feed it catRelToRoot (NOT catAbs).
+      const catalogExistedBefore = existsSync(catAbs);
+      if (catalogExistedBefore) batch.backupFile(catRelToRoot);
       writeFileSync(join(appRoot, file), out.code, 'utf8');
-      catalogResult = mergeCatalog(catAbs, out.keys, { overwrite: overwriteKeys });
+      catalogResult = mergeCatalogForLayout(catAbs, catalogLayout, namespace, out.keys, {
+        overwrite: overwriteKeys,
+      });
+      // record a catalog the run CREATED (did not exist before) so --rollback can
+      // delete it — leaving no dangling namespace catalog after a revert (MINOR).
+      if (!catalogExistedBefore) batch.recordCreatedCatalog(catRelToRoot);
       ledger.files[file] = {
         status: 'written',
         confidence,
         namespace,
+        layout: catalogLayout,
         keys: out.keys,
-        catalog: catAbs.split(sep).join('/'),
+        catalog: catRelToRoot,
+        catalogCreated: !catalogExistedBefore,
         backupPath,
         collateralTests,
         batchId: batch.batchId,
@@ -694,7 +876,8 @@ export function extract(inventory, options = {}) {
       changed: true,
       keys: out.keys,
       namespace,
-      catalog: catAbs.split(sep).join('/'),
+      catalog: catRelToRoot,
+      catalogLayout,
       catalogMerge: catalogResult ? { added: catalogResult.added, kept: catalogResult.kept } : null,
       backupPath,
       collateralTests,
@@ -867,14 +1050,30 @@ export function promoteStaged(appRoot, file, options = {}) {
 
   writeFileSync(join(appRoot, file), stagedCode, 'utf8');
   const liveCatalogAbs = join(appRoot, entry.liveCatalog);
-  const merge = mergeCatalog(liveCatalogAbs, stagedKeys, { overwrite: overwriteKeys });
+  // honor the live layout the staging step resolved (DEFECT 1). Older staged
+  // manifests (pre-fix) lack liveLayout — re-resolve against the app as a fallback
+  // so a manifest written before this fix still promotes into the right shape.
+  const liveLayout =
+    entry.liveLayout ||
+    detectCatalogLayout(appRoot, entry.messagesDir || DEFAULT_MESSAGES_DIR, entry.sourceLocale || DEFAULT_SOURCE_LOCALE) ||
+    'split';
+  // back up a pre-existing live catalog before the merge; record a created one so
+  // a rollback of this promotion removes the dangling catalog (MINOR).
+  const liveCatalogExistedBefore = existsSync(liveCatalogAbs);
+  if (liveCatalogExistedBefore) batch.backupFile(entry.liveCatalog);
+  const merge = mergeCatalogForLayout(liveCatalogAbs, liveLayout, entry.namespace, stagedKeys, {
+    overwrite: overwriteKeys,
+  });
+  if (!liveCatalogExistedBefore) batch.recordCreatedCatalog(entry.liveCatalog);
 
   ledger.files[key] = {
     status: 'written',
     confidence: entry.confidence,
     namespace: entry.namespace,
+    layout: liveLayout,
     keys: stagedKeys,
     catalog: entry.liveCatalog,
+    catalogCreated: !liveCatalogExistedBefore,
     backupPath,
     collateralTests,
     batchId: batch.batchId,

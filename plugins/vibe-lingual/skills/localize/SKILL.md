@@ -36,16 +36,27 @@ A file's routing confidence is the **most-cautious** of its included sites — o
 
 | File confidence | Route | What happens |
 |---|---|---|
-| **high** (every site high) | **auto-write** | Backup FIRST → codemod rewrites the live source → namespaced catalog merged (atomic). Recorded in the extract ledger for resumability. |
+| **high** (every site high) | **auto-write** | Backup FIRST → codemod rewrites the live source → namespaced catalog merged (atomic) **into the app's existing layout** (see below). Recorded in the extract ledger for resumability. |
 | **medium** | **stage** | The rewrite + catalog are written to `.vibe-lingual/localize/staged/<file>` for review, and a `staged-manifest.json` entry records the read-back contract (live target, namespace, catalog paths, collateral tests). Live source UNTOUCHED. Promote with `--apply-staged <live-rel-path>` once reviewed. |
 | **low** | **inline-only** | A suggestion surfaced in the banner. No write at all. |
 | **blocked** (audit readiness) | **inline-only** | A firebase-admin SSR file or an unhandled dynamic-route glob NEVER auto-writes, regardless of confidence. The block reason is surfaced. |
+
+## Catalog layout — match what the app already has
+
+next-intl loads catalogs in one of two shapes, and the engine **writes into whichever the app already uses** (the run-report's `catalogLayout` per result tells you which):
+
+- **flat** — `messages/<locale>.json`, ONE file per locale keyed by namespace at the top level (`{ "Greeting": { "welcomeBack": "…" } }`). This is the cowpath/Celestia3 shape **and exactly what the wired `request.ts` template imports** (`messages/${locale}.json`). New keys are merged UNDER the namespace inside that file; sibling namespaces are left untouched.
+- **split** — `messages/<locale>/<NS>.json`, one file per namespace holding a flat key→text map.
+
+The engine detects a pre-existing `messages/<locale>.json` (flat) or `messages/<locale>/` dir (split) and writes into it; **only when no catalog exists yet does it default to split**. This closes the runtime-breaking gap the Celestia3 dogfood found: on a flat-wired app, writing a parallel `messages/<locale>/<NS>.json` produces a catalog `request.ts` never reads, so every `t()` key resolves to `MISSING_MESSAGE`. Promotion (`--apply-staged`) honors the same live layout. If you wire a fresh app flat, the catalogs the loop writes will match `request.ts` automatically.
 
 ## Backup + rollback (load-bearing order)
 
 Every auto-write batch creates a timestamped backup batch at `.vibe-lingual/localize/backup/<batchId>/` mirroring the source tree, with a `manifest.json` mapping each backup to its source. **The order is always: backup → write source → merge catalog → ledger entry.** A mutation that skipped the backup is the one bug the backup module exists to make impossible. `--rollback <timestamp>` restores every file in a batch to its exact original bytes (CRLF, trailing newlines, the original quote style — all verbatim). The codemod's recast pass normalizes formatting; rollback undoes that too.
 
 **Rollback also keeps engine state coherent.** Restoring a file to its pre-extract bytes makes the extract ledger's `written` entry a lie — left in place, the next extract would report `skipped-done` and silently refuse to re-localize the rolled-back file. So rollback **prunes the restored files from the extract ledger (and any staged-manifest entries)**; the return carries `ledgerPruned[]` / `stagedPruned[]`. As a belt-and-suspenders for out-of-band reverts (a `git checkout` or manual edit that never went through `--rollback`), extract re-verifies each ledger-`written` file against the source: if the next-intl markers (`useTranslations`/`getTranslations`/`useFormatter`/the `next-intl` import) are gone, the ledger entry is treated as stale and the file is re-extracted. A rolled-back file is always re-localizable.
+
+**Rollback cleans up created catalogs too.** A catalog the batch CREATED (one that did not exist before the run) has no prior bytes to restore — restoring only the source would leave a dangling namespace catalog (an orphan `messages/<locale>/<NS>.json`, or a stray namespace block in a flat file the run created). So rollback **deletes the catalogs the batch created** and reports them in `catalogsRemoved[]`; a catalog that existed BEFORE the run is restored to its exact prior bytes (and reported as restored, never deleted). After a rollback the repo carries no half-localized catalog state.
 
 ## Workflow
 
@@ -103,7 +114,7 @@ Emit the two guards:
 
 ### 9. Test-harness collateral (engine-driven)
 
-Adding next-intl hooks to a component breaks its EXISTING tests — they now need a `NextIntlClientProvider` wrapper. This is **handled by the extract engine, not by hand** (the cowpath called it mechanical/automatable): for every auto-written component the engine discovers a co-located test (`<Base>.test.tsx` / `.spec.tsx`, sibling or under `__tests__/`), **backs it up INTO the same batch** (so `--rollback` returns the repo to a coherent pre-localize state — component AND test both restored), and provider-wraps it (`<NextIntlClientProvider locale="en" messages={{}} timeZone="UTC">` around each `render(...)`). The same happens on `--apply-staged` promotion.
+Adding next-intl hooks to a component breaks its EXISTING tests — they now need a `NextIntlClientProvider` wrapper. This is **handled by the extract engine, not by hand** (the cowpath called it mechanical/automatable): for every auto-written component the engine discovers its tests (`<Base>.test.tsx` / `.spec.tsx`) — a sibling, a same-dir `__tests__/`, **OR any ancestor `__tests__/` up to the app root** (the project-root `src/__tests__/` convention many apps use; Celestia3 keeps 93 suites there) — **backs them up INTO the same batch** (so `--rollback` returns the repo to a coherent pre-localize state — component AND test both restored), and provider-wraps it (`<NextIntlClientProvider locale="en" messages={{}} timeZone="UTC">` around each `render(...)`). The same happens on `--apply-staged` promotion.
 
 The wrap is **per render call, not per file**: a test with N `render()` calls (one per `test()` block — the dominant React Testing Library pattern) gets ALL N wrapped, so no bare render of the now-i18n'd component is left to throw `No intl context found` and turn the suite red. The counts in `summary.collateralTestsWrapped` / `collateralTestsNeedManualWrap` are therefore render-call totals, and a per-edit `wrappedCount` / `needsManualWrap` is on each `testEdits[]` entry.
 
