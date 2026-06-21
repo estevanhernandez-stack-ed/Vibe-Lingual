@@ -1,0 +1,13 @@
+{
+  "name": "fixture-app-router-no-intl",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbo",
+    "build": "next build"
+  },
+  "dependencies": {
+    "next": "^16.2.6",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
+}

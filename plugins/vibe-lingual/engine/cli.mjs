@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-// vibe-lingual engine CLI — dispatch stub (M0).
-// Real subcommand implementations land in later milestones (M1+).
+// vibe-lingual engine CLI — dispatch.
+// `detect` is implemented (M1); the rest land in later milestones.
+
+import { detect } from './detect.mjs';
 
 const SUBCOMMANDS = ['scan', 'audit', 'extract', 'wire', 'parity', 'detect'];
 
@@ -33,6 +35,12 @@ function main(argv) {
     console.error('');
     console.error(usage());
     return 1;
+  }
+
+  if (sub === 'detect') {
+    const root = argv[1] || process.cwd();
+    console.log(JSON.stringify(detect(root), null, 2));
+    return 0;
   }
 
   console.log(`vibe-lingual ${sub}: not yet implemented`);
