@@ -4,14 +4,21 @@
 // into next-intl translation calls, SERVER-COMPONENT-AWARE and modeled
 // BYTE-FOR-BYTE on the proven Celestia3 cowpath shapes:
 //
-//   - SERVER component (App-Router default, NO "use client") → `getTranslations`
-//     (async, imported from 'next-intl/server'). The cowpath shape is
-//     src/app/s/[shareId]/page.tsx: `const t = await getTranslations('Share');`
-//     then `{t('cta')}`. Only async functions can `await getTranslations`, so a
-//     server file is only rewritten when its enclosing component is async.
-//   - CLIENT component ("use client") → `useTranslations` hook. The cowpath shape
-//     is src/components/settings/LanguageSettings.tsx:
+//   - SERVER component → `getTranslations` (async, imported from
+//     'next-intl/server'). The cowpath shape is src/app/s/[shareId]/page.tsx:
+//     `const t = await getTranslations('Share');` then `{t('cta')}`. A file is
+//     SERVER only when its component is ALREADY async AND uses NO client signals
+//     (no client-only hook, no event handler). We never convert a non-async
+//     function to async, and a missing 'use client' directive does NOT by itself
+//     mean server — an App-Router leaf without the directive is still a client
+//     component when imported into a client tree (Phase-2 BUG-1).
+//   - CLIENT component → `useTranslations` hook. The cowpath shape is
+//     src/components/settings/LanguageSettings.tsx:
 //     `const t = useTranslations('CosmicCalibration');` then `{t('interfaceLanguageHeading')}`.
+//     A file is CLIENT when it carries 'use client' OR uses any client-only hook
+//     (useState/useEffect/… or a custom use[A-Z]* hook) OR wires an event handler
+//     (onClick…); ambiguous files (no directive, no signals, not async) prefer
+//     client, since useTranslations is safe in both trees.
 //   - DATE site (Intl.DateTimeFormat / toLocale*String for DISPLAY) → `useFormatter`
 //     (client). The cowpath shape is src/components/TransitFeed.tsx:
 //     `const format = useFormatter();` then
@@ -228,8 +235,10 @@ export function transform(source, options = {}) {
 
 // Build the per-file transform context: namespace, server/client mode, and the
 // catalog accumulator. Mode detection: an explicit options.isClient wins;
-// otherwise the "use client" directive in the source decides (App-Router default
-// is server). The context is threaded through every rewrite.
+// otherwise decideIsClient() classifies by client signals (directive OR
+// client-only hook OR event handler), falling back to server only for an
+// already-async, signal-free component. The context is threaded through every
+// rewrite.
 function buildContext(path, options) {
   const namespace = options.namespace || deriveNamespace(path);
   return {
@@ -238,6 +247,88 @@ function buildContext(path, options) {
     isClientExplicit: typeof options.isClient === 'boolean' ? options.isClient : null,
     keys: {}, // key -> source text, the namespaced catalog fragment for this file
   };
+}
+
+// React client-only hooks: a component calling ANY of these (or any custom
+// use[A-Z]* hook) is a CLIENT component in the App Router, with or without a
+// 'use client' directive — the directive only needs to exist at the top of the
+// client *tree*, so an imported leaf can be a client component silently. The
+// codemod must classify on usage, not on the directive alone (Phase-2 BUG-1).
+const CLIENT_ONLY_HOOKS = new Set([
+  'useState',
+  'useEffect',
+  'useReducer',
+  'useContext',
+  'useRef',
+  'useCallback',
+  'useMemo',
+  'useLayoutEffect',
+  'useImperativeHandle',
+  'useInsertionEffect',
+  'useSyncExternalStore',
+  'useTransition',
+  'useDeferredValue',
+  'useId',
+  'useDebugValue',
+  'useOptimistic',
+  'useFormStatus',
+  'useActionState',
+]);
+
+// Event-handler JSX attribute names start with `on` + uppercase (onClick,
+// onChange, onSubmit, …). A component wiring these is interactive → client.
+const EVENT_HANDLER_ATTR_RE = /^on[A-Z]/;
+
+// Does `name` look like a React hook? Built-in client-only, or any custom
+// `use[A-Z]…` (useAuth, useSubscription, useNativeApp — all client in practice).
+function isClientHookName(name) {
+  if (typeof name !== 'string') return false;
+  if (CLIENT_ONLY_HOOKS.has(name)) return true;
+  return /^use[A-Z]/.test(name);
+}
+
+// Scan the whole file for client-only signals: any call to a client hook, or any
+// JSX event-handler attribute. Used to override the "no directive ⇒ server"
+// assumption. Returns true the moment a client signal is found.
+function usesClientSignals(j, root) {
+  let found = false;
+  // hook calls: `useState(...)`, `useAuth(...)`, `useSubscription(...)`, …
+  root.find(j.CallExpression).forEach((p) => {
+    if (found) return;
+    const callee = p.node.callee;
+    if (callee && callee.type === 'Identifier' && isClientHookName(callee.name)) {
+      found = true;
+    }
+  });
+  if (found) return true;
+  // event-handler props: `onClick={...}`, `onChange={...}`, …
+  root.find(j.JSXAttribute).forEach((p) => {
+    if (found) return;
+    const nameNode = p.node.name;
+    const attrName = nameNode && nameNode.name;
+    if (typeof attrName === 'string' && EVENT_HANDLER_ATTR_RE.test(attrName)) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+// Decide CLIENT vs SERVER for a file. Rules (Phase-2 BUG-1 fix):
+//   - CLIENT if it uses ANY client-only hook or event handler, OR carries a
+//     'use client' directive — regardless of async-ness.
+//   - SERVER (getTranslations, must be async) ONLY when the chosen component is
+//     async AND there are no client signals.
+//   - Ambiguous (no directive, no client signals, not async) → prefer CLIENT.
+//     useTranslations is safe in both trees; getTranslations is not, and we must
+//     never convert a non-async function to async to satisfy it.
+// An explicit options.isClient always wins (the SKILL may know better).
+function decideIsClient(j, root) {
+  if (hasUseClientDirective(j, root)) return true;
+  if (usesClientSignals(j, root)) return true;
+  // No directive, no client signals: server ONLY if the component is async.
+  const body = findComponentBody(j, root);
+  const ownerAsync = !!(body && body._ownerFn && body._ownerFn.async);
+  return ownerAsync ? false : true; // prefer client when not async (ambiguous)
 }
 
 function hasUseClientDirective(j, root) {
@@ -295,8 +386,15 @@ function materializeLeadingDirective(j, root) {
 }
 
 function runCodemod(j, root, ctx) {
-  const isClient = ctx.isClientExplicit != null ? ctx.isClientExplicit : hasUseClientDirective(j, root);
+  const isClient = ctx.isClientExplicit != null ? ctx.isClientExplicit : decideIsClient(j, root);
   ctx.isClient = isClient;
+
+  // The component body whose hook will provide `t`. Computed ONCE up front so the
+  // rewrite loops can check scope-reachability: a literal is only rewritten when
+  // it sits inside this body (Phase-2 BUG-2). A literal in a closure defined
+  // OUTSIDE this body — a module-scope `dynamic(() => import(...), { loading })`
+  // option, a top-level const — has no `t` in scope and must be LEFT INLINE.
+  const componentBody = findComponentBody(j, root);
 
   // Normalize a `program.directives` "use client" into an explicit leading body
   // ExpressionStatement BEFORE any insertion. recast prints a directive node with
@@ -315,6 +413,7 @@ function runCodemod(j, root, ctx) {
     const raw = p.node.value;
     if (!isUserFacingText(raw, 'jsx-text')) return;
     if (isInsideTranslationCall(j, p)) return; // idempotency
+    if (!isReachableFromComponentBody(p, componentBody)) return; // BUG-2: t out of scope
     const text = raw.trim();
     const key = registerKey(ctx, text);
     // Preserve surrounding whitespace: a JSX text node may carry leading/trailing
@@ -348,6 +447,7 @@ function runCodemod(j, root, ctx) {
     const lit = stringLiteralNodeValue(value);
     if (lit == null) return;
     if (!isUserFacingText(lit, ATTR_KIND[lower])) return;
+    if (!isReachableFromComponentBody(p, componentBody)) return; // BUG-2: t out of scope
     const key = registerKey(ctx, lit);
     p.node.value = j.jsxExpressionContainer(tCall(j, key));
     textChanged = true;
@@ -360,6 +460,10 @@ function runCodemod(j, root, ctx) {
   if (isClient) {
     collectDisplayDateSites(j, root, dateSites);
     for (const site of dateSites) {
+      // BUG-2 (date analog): `format` lives in the component body. A date site in
+      // a closure defined OUTSIDE the body (module-scope `dynamic` options) can't
+      // reach it — leave such sites inline.
+      if (!isReachableFromComponentBody(site.path, componentBody)) continue;
       rewriteDateSite(j, site);
       dateChanged = true;
     }
@@ -430,6 +534,28 @@ function stringLiteralNodeValue(value) {
     }
   }
   return null;
+}
+
+// Scope-reachability (Phase-2 BUG-2): a literal may only be rewritten to a
+// t()/format.* call when the `t`/`format` binding is in scope at the literal's
+// position. That binding is declared at the top of `componentBody`, so any
+// literal lexically nested inside `componentBody` can reach it via closure
+// (nested JSX, `.map()` render callbacks, conditional sub-renders — all fine).
+// A literal OUTSIDE `componentBody` — module-scope `dynamic(() => import(...),
+// { loading: () => ... })` options, top-level consts, a sibling component —
+// has no such binding and must be LEFT INLINE.
+//
+// Reachable ⇔ `componentBody` is an ancestor of the literal's path. If we never
+// resolved a component body (defensive: nothing to anchor a hook to), nothing is
+// reachable and every literal is left inline.
+function isReachableFromComponentBody(path, componentBody) {
+  if (!componentBody) return false;
+  let cur = path.parent;
+  while (cur) {
+    if (cur.node === componentBody) return true;
+    cur = cur.parent;
+  }
+  return false;
 }
 
 // Is this path inside an already-extracted translation/formatter call?

@@ -290,3 +290,214 @@ export default function Empty() {
     expect(out.code).toBe(src);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase-2 BUG-1 — server/client classification by USAGE, not by directive.
+// The at-scale Celestia3 run found components with NO 'use client' directive that
+// use client-only hooks (useState + custom useAuth/useSubscription). The old
+// "no directive ⇒ server" heuristic rewrote them to `export default async
+// function` + getTranslations — invalid (an async server component can't call
+// useState). The fix classifies on client signals (hooks / handlers) instead.
+// ---------------------------------------------------------------------------
+describe('BUG-1 — client detection without a directive', () => {
+  test('(a) no directive + useState → CLIENT useTranslations, NOT async/getTranslations', () => {
+    // WelcomeModal shape: no 'use client', uses useState. Must be client.
+    const src = `import React, { useState } from 'react';
+
+export default function WelcomeModal({ isOpen, userName }) {
+  const [dontShowAgain, setDontShowAgain] = useState(false);
+  if (!isOpen) return null;
+  return (
+    <div className="modal">
+      <h2>Welcome back</h2>
+      <p>Align your digital self with the cosmos</p>
+    </div>
+  );
+}
+`;
+    const out = transform(src, { path: 'src/components/WelcomeModal.tsx' });
+    expect(out.changed).toBe(true);
+    // CLIENT path: useTranslations hook, NOT the server getTranslations.
+    expect(out.code).toContain("import { useTranslations } from 'next-intl'");
+    expect(out.code).toContain("const t = useTranslations('WelcomeModal')");
+    expect(out.code).not.toContain('getTranslations');
+    expect(out.code).not.toContain('next-intl/server');
+    // the function must NOT have been converted to async.
+    expect(out.code).not.toMatch(/async function WelcomeModal/);
+    expect(out.code).toMatch(/export default function WelcomeModal/);
+    // literals extracted.
+    expect(out.code).toContain("{t('welcomeBack')}");
+  });
+
+  test('(a2) no directive + custom use* hook (useAuth/useSubscription) → CLIENT', () => {
+    // ManageSubscription shape: no directive, custom client hooks + useState.
+    const src = `import React, { useState } from 'react';
+import { useAuth } from '@/context/AuthContext';
+import { useSubscription } from '@/context/SubscriptionContext';
+
+export function ManageSubscription() {
+  const { user } = useAuth();
+  const { subscription } = useSubscription();
+  const [isProcessing, setIsProcessing] = useState(false);
+  return <div><h3>Manage your subscription</h3></div>;
+}
+`;
+    const out = transform(src, { path: 'src/components/ManageSubscription.tsx' });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("useTranslations('ManageSubscription')");
+    expect(out.code).not.toContain('getTranslations');
+    expect(out.code).not.toMatch(/async function ManageSubscription/);
+  });
+
+  test('(a3) no directive + event handler (onClick) → CLIENT', () => {
+    const src = `import React from 'react';
+
+export default function Btn({ onClose }) {
+  return <button onClick={onClose}>Close the dialog</button>;
+}
+`;
+    const out = transform(src, { path: 'src/components/Btn.tsx' });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("useTranslations('Btn')");
+    expect(out.code).not.toContain('getTranslations');
+    expect(out.code).not.toMatch(/async function Btn/);
+  });
+
+  test('(b) no directive + pure render, NO hooks + already async → SERVER getTranslations', () => {
+    // An async server component with no client signals: server is valid (it can
+    // await), so getTranslations is correct.
+    const src = `export default async function NotFound() {
+  return (
+    <main>
+      <h1>Reading not found</h1>
+    </main>
+  );
+}
+`;
+    const out = transform(src, { path: 'src/app/s/[shareId]/page.tsx', namespace: 'Share' });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("import { getTranslations } from 'next-intl/server'");
+    expect(out.code).toContain("const t = await getTranslations('Share')");
+    expect(out.code).not.toContain('useTranslations');
+  });
+
+  test('(b2) no directive + pure render, NO hooks + NOT async → CLIENT (never convert to async)', () => {
+    // Ambiguous: no directive, no client signals, but the function is NOT async.
+    // We must NOT flip it to async to satisfy getTranslations — prefer client.
+    const src = `export default function Banner() {
+  return <div><p>System status nominal</p></div>;
+}
+`;
+    const out = transform(src, { path: 'src/components/Banner.tsx' });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("useTranslations('Banner')");
+    expect(out.code).not.toContain('getTranslations');
+    // critical: the function stays NON-async.
+    expect(out.code).not.toMatch(/async function Banner/);
+    expect(out.code).toMatch(/export default function Banner/);
+  });
+
+  test('(c) explicit "use client" directive → CLIENT (directive wins for client)', () => {
+    const src = `"use client";
+export default function Panel() {
+  return <div><span>Open settings</span></div>;
+}
+`;
+    const out = transform(src, { path: 'src/components/Panel.tsx' });
+    expect(out.changed).toBe(true);
+    expect(out.code).toContain("useTranslations('Panel')");
+    expect(out.code).not.toContain('getTranslations');
+  });
+
+  test('(c2) explicit "use client" + happens to be async → still CLIENT (directive wins)', () => {
+    // A 'use client' async component is still a client component; never server.
+    const src = `"use client";
+import React, { useState } from 'react';
+export default function AsyncClient() {
+  const [x] = useState(0);
+  return <div><span>Loading your chart</span></div>;
+}
+`;
+    const out = transform(src, { path: 'src/components/AsyncClient.tsx' });
+    expect(out.code).toContain('useTranslations');
+    expect(out.code).not.toContain('getTranslations');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase-2 BUG-2 — module-scope closure literals must stay INLINE.
+// AstrocartographyView had a `dynamic(() => import(...), { loading: () => (
+// <div>Loading map…</div>) })` at module scope. The codemod emitted t('loadingMap')
+// there, but `t` is only declared inside the component body (useTranslations) →
+// ReferenceError at render. The loading-closure literal must be left inline; the
+// component-body literals must still extract.
+// ---------------------------------------------------------------------------
+describe('BUG-2 — t-binding scope reachability', () => {
+  const src = `'use client';
+import React from 'react';
+import dynamic from 'next/dynamic';
+
+const MapInner = dynamic(() => import('./MapInner'), {
+  ssr: false,
+  loading: () => (
+    <div className="loader">
+      <span>Loading map please wait</span>
+    </div>
+  ),
+});
+
+export default function AstroView() {
+  return (
+    <div className="view">
+      <MapInner />
+      <h2>Your astrocartography</h2>
+    </div>
+  );
+}
+`;
+
+  test('the module-scope dynamic() loading literal is LEFT INLINE (no t())', () => {
+    const out = transform(src, { path: 'src/components/AstroView.tsx' });
+    expect(out.changed).toBe(true);
+    // the loading-closure literal stays verbatim — `t` is not in scope there.
+    expect(out.code).toContain('Loading map please wait');
+    expect(out.code).not.toContain("t('loadingMap')");
+    expect(out.code).not.toContain("t('loadingMapPleaseWait')");
+  });
+
+  test('the component-body literal STILL extracts to t()', () => {
+    const out = transform(src, { path: 'src/components/AstroView.tsx' });
+    expect(out.code).toContain("{t('yourAstrocartography')}");
+    expect(out.code).toContain("const t = useTranslations('AstroView')");
+  });
+
+  test('the loading literal is not registered as a catalog key', () => {
+    const out = transform(src, { path: 'src/components/AstroView.tsx' });
+    // only the component-body key lands in the catalog.
+    expect(out.keys).toMatchObject({ yourAstrocartography: 'Your astrocartography' });
+    const values = Object.values(out.keys);
+    expect(values).not.toContain('Loading map please wait');
+  });
+
+  test('a top-level const literal outside any component body is left inline', () => {
+    const top = `'use client';
+const HEADING = "Welcome to the cosmos";
+export default function C() {
+  return <div><h1>Your reading is ready</h1></div>;
+}
+`;
+    const out = transform(top, { path: 'src/components/C.tsx' });
+    // the module-scope const string is not JSX text and not in the body → untouched.
+    expect(out.code).toContain('const HEADING = "Welcome to the cosmos"');
+    expect(out.code).toContain("{t('yourReadingIsReady')}");
+  });
+
+  test('(e) idempotency holds — the loading literal stays inline on re-run, body stable', () => {
+    const r = idempotent(src, { path: 'src/components/AstroView.tsx' });
+    expect(r.stable).toBe(true);
+    expect(r.secondChanged).toBe(false);
+    // the loading literal survived both passes; the hook is added exactly once.
+    expect(r.first.code).toContain('Loading map please wait');
+    expect(r.first.code.match(/useTranslations\(/g).length).toBe(1);
+  });
+});
