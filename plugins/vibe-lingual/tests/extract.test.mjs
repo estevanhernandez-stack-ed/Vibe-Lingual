@@ -738,3 +738,48 @@ describe('rollback ledger coherence — a rolled-back file is re-extractable', (
     expect(restaged.summary.staged).toBe(1);
   });
 });
+
+// Phase-2 Celestia3 regression: a CLIENT component WITHOUT a 'use client'
+// directive (it inherits the boundary from a parent) still uses client-only
+// hooks (useState). extract.mjs must NOT force isClient:false from a directive-
+// only probe and mask the transform's decideIsClient() — that produced an
+// invalid `export default async function … getTranslations` server rewrite
+// (an async server component cannot call useState). extract must DEFER (pass no
+// explicit isClient) so the fixed decideIsClient classifies it CLIENT.
+const DIRECTIVELESS_CLIENT = `import React, { useState } from 'react';
+
+export default function WelcomeModal() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="wrap" onClick={() => setOpen(!open)}>
+      <h1>Welcome back</h1>
+      <p>Choose your destiny</p>
+    </div>
+  );
+}
+`;
+
+describe('client classification — directive-less client component', () => {
+  let root;
+  beforeEach(() => {
+    root = tmpApp();
+    write(root, 'src/components/WelcomeModal.tsx', DIRECTIVELESS_CLIENT);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  test('a useState component with no "use client" extracts as CLIENT, not async server', () => {
+    const inv = scan(root, detect(root));
+    extract(inv, { appRoot: root, stageAll: true });
+    const promoted = promoteStaged(root, 'src/components/WelcomeModal.tsx');
+    expect(promoted.ok).toBe(true);
+
+    const src = readFileSync(join(root, 'src/components/WelcomeModal.tsx'), 'utf8');
+    // CLIENT path: useTranslations from 'next-intl', body-scoped, NO await/async.
+    expect(src).toContain("import { useTranslations } from 'next-intl'");
+    expect(src).toContain("const t = useTranslations('WelcomeModal')");
+    // the bug: must NOT convert to async server component.
+    expect(src).not.toContain('getTranslations');
+    expect(src).not.toContain('next-intl/server');
+    expect(src).not.toMatch(/export default async function/);
+  });
+});

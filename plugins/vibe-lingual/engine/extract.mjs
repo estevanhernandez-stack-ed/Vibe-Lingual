@@ -107,14 +107,25 @@ function readinessIndex(auditObj) {
   return idx;
 }
 
-// Is a file a CLIENT component? Prefer the inventory site flag if present; else
-// read the source for a "use client" directive (the codemod also self-detects,
-// but extract needs the mode to record + to choose the catalog note).
+// Is a file a CLIENT component? Return `true` ONLY when the source positively
+// carries a "use client" directive. Otherwise return `null` and DEFER to the
+// codemod's own decideIsClient() (transform.mjs) — it is the fixture-tested
+// authority and, as of the Phase-2 BUG-1 fix, classifies a directive-less file
+// by its client signals (useState/useEffect/custom use[A-Z] hooks/event
+// handlers) and only treats an async-no-signals file as SERVER. An explicit
+// isClient passed from here WINS over decideIsClient (transform.mjs line ~389),
+// so returning a wrong `false` for a directive-less client component (Celestia3
+// WelcomeModal/ManageSubscription/UpgradeModal — useState, no directive) masked
+// the fix and emitted an invalid `async ... getTranslations` server rewrite.
+// Deferring lets the corrected decision run. We force the value ONLY on the one
+// case we can be certain of from a cheap regex: the explicit directive.
 function isClientFile(appRoot, relPath) {
   try {
     const src = readFileSync(join(appRoot, relPath), 'utf8');
-    return /^\s*['"]use client['"]\s*;?/m.test(src.split('\n').slice(0, 5).join('\n')) ||
+    const hasDirective =
+      /^\s*['"]use client['"]\s*;?/m.test(src.split('\n').slice(0, 5).join('\n')) ||
       /^['"]use client['"]/.test(src.trimStart());
+    return hasDirective ? true : null;
   } catch {
     return null;
   }
