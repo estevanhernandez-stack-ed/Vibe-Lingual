@@ -38,7 +38,7 @@ None. `scan` is the first command — it has no upstream state to read. It produ
      --inventory <appRoot>/.vibe-lingual/state/inventory.json \
      --brief <appRoot>/docs/vibe-lingual/scan-<date>.md
    ```
-   The CLI runs `detect` → `scan` → `brief` internally and writes both files atomically (it `mkdir -p`s the parent dirs). It prints a one-line summary to stderr: total sites, structural-excluded count, file count, and the two output paths. Capture that line.
+   The CLI runs `detect` → `scan` → `brief` internally and writes both files atomically (it `mkdir -p`s the parent dirs). It prints a one-line summary to stderr: total sites, structural-excluded count, the **files-with-localizable-work count** (files holding ≥1 included site — files whose only sites are excluded structural-`Intl` are NOT counted, so this matches brief Block 2 exactly), and the two output paths. Capture that line.
 
 4. **Confirm the inventory validates.** Read back `.vibe-lingual/state/inventory.json` and sanity-check it against `plugins/vibe-lingual/schemas/inventory.schema.json`:
    - Required top-level keys present: `schemaVersion` (must be `1`), `app`, `existingI18n`, `sites`, `countsByKind`, `componentsByDensity`.
@@ -51,7 +51,7 @@ None. `scan` is the first command — it has no upstream state to read. It produ
 
 6. **Surface the six-block brief.** Read the dated brief and present it to the user. It carries all six blocks, every number grounded in the inventory:
    - **Block 1 — Framework & i18n detection:** router type, i18n framework (or `none`), Turbopack, SSR surfaces. Recommends next-intl-without-routing when the app is App-Router + no-lib.
-   - **Block 2 — Surface inventory:** file count, total included sites, top components by string density (where the work concentrates).
+   - **Block 2 — Surface inventory:** files-with-localizable-work count (same number as the stderr summary and banner — files holding ≥1 included site; structural-`Intl`-only files are excluded and noted parenthetically), total included sites, top components by string density (where the work concentrates).
    - **Block 3 — String-source audit:** counts by kind, with structural `Intl` sites called out as EXCLUDED (tz-offset math / locale-invariant parsing — extracting them corrupts logic). Notes that the scanner owns attribute-literal detection, not ESLint.
    - **Block 4 — Existing-localization map:** detected i18n lib, existing language list (reuse it — don't generate a parallel one), locale preference, and the dual-locale check (UI locale vs content/output locale do not move in lockstep).
    - **Block 5 — Gap + phased plan:** the extract → wire → translate → wire-to-locale → guard arc, sized to this app's counts.
@@ -71,7 +71,7 @@ Existing:   SUPPORTED_LANGUAGES (src/lib/languages.ts) · outputLanguage (src/ty
 
 Sites:      922 total (22 structural Intl excluded)
 By kind:    jsx-text 725 · placeholder 25 · aria-label 57 · title 20 · alt 14 · toast 38 · date-intl 43
-Files:      66 with user-facing strings
+Files:      66 with localizable strings (matches brief Block 2)
 Top file:   src/components/DashboardShell.tsx (NN sites)
 
 Inventory:  .vibe-lingual/state/inventory.json

@@ -60,9 +60,23 @@ function block1(inv) {
 
 function block2(inv) {
   const included = includedSites(inv);
-  const componentFiles = new Set(inv.sites.map((s) => s.file));
+  // Files-with-localizable-work — the count of files that hold at least one
+  // INCLUDED site. This is `componentsByDensity.length` by construction (density
+  // ranks included sites only), so the brief, the CLI stderr summary, and the
+  // SKILL banner all report the SAME number. The eight Celestia3 files whose only
+  // sites are excluded structural-Intl (tz math, date-key logic) carry no
+  // localization work and must NOT inflate this count — they are reported as the
+  // structural-excluded callouts in Block 3, not here.
+  const filesWithLocalizableWork = inv.componentsByDensity.length;
+  const filesWithAnySite = new Set(inv.sites.map((s) => s.file)).size;
+  const structuralOnlyFiles = filesWithAnySite - filesWithLocalizableWork;
   const lines = ['## 2. Surface inventory', ''];
-  lines.push(`- **Component/source files with user-facing strings:** ${componentFiles.size}`);
+  lines.push(`- **Files with localizable strings:** ${filesWithLocalizableWork}`);
+  if (structuralOnlyFiles > 0) {
+    lines.push(
+      `  - (${filesWithAnySite} files carry at least one string site; ${structuralOnlyFiles} hold only structural \`Intl\` sites — date-key / tz math, no localization work. See Block 3.)`,
+    );
+  }
   lines.push(`- **Total string sites (included):** ${included.length}`);
   lines.push('');
   lines.push('Top components by string density (localization work concentrates here):');
