@@ -154,6 +154,17 @@ function runAudit(argv) {
     inventory = scan(root, detect(root));
   }
 
+  // The audit's gotcha list and readiness rules are Next/JS-specific; running
+  // them over a WPF inventory would emit confident noise (the M8 fail-loud
+  // principle applied to a stack). Scan/brief carry the WPF read side; audit
+  // stands down until the wpf-resx adapter lands.
+  if (inventory.app && inventory.app.stack === 'wpf') {
+    console.error(
+      'vibe-lingual audit: the WPF stack is scan-only in this version — the audit rules are Next/JS-specific and the wpf-resx adapter is not yet implemented. The scan brief carries the WPF readiness picture.',
+    );
+    return 1;
+  }
+
   // `root` enables the firebase-admin-SSR rule (the only source-dependent check).
   // When the inventory carries its own app.root, prefer that — it is the tree the
   // inventory's ssrFiles are relative to. Fall back to the positional root.
@@ -296,6 +307,16 @@ function runExtract(argv) {
   }
   const inventory = loadInventoryOrDie('extract', args.inventory);
   if (inventory == null) return 2;
+
+  // The codemod is a jscodeshift transform over JS/TS — pointing it at a WPF
+  // inventory would route XAML files into a JavaScript parser. Stand down until
+  // the wpf-resx adapter brings its own transform.
+  if (inventory.app && inventory.app.stack === 'wpf') {
+    console.error(
+      'vibe-lingual extract: the WPF stack is scan-only in this version — the codemod is JS/TS-only and the wpf-resx adapter is not yet implemented. Nothing was written.',
+    );
+    return 1;
+  }
 
   let auditObj = null;
   if (typeof args.audit === 'string') {

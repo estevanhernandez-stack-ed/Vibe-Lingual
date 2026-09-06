@@ -200,8 +200,10 @@ describe('detect — robustness', () => {
       'root',
       'routerType',
       'ssrFiles',
+      'stack',
       'turbopack',
     ]);
+    expect(result.app.stack).toBe('js');
     expect(Object.keys(result.existingI18n).sort()).toEqual([
       'languageList',
       'lib',

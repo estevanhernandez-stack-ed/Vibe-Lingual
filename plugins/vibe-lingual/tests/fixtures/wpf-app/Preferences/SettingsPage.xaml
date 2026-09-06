@@ -1,0 +1,21 @@
+<UserControl x:Class="FixtureApp.Preferences.SettingsPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.example/winfx/ui">
+    <UserControl.Resources>
+        <Style x:Key="RetryButton" TargetType="Button">
+            <Setter Property="Content" Value="Retry" />
+            <Setter Property="Background" Value="#FF0000" />
+            <Setter Property="Margin" Value="0,4,0,0" />
+        </Style>
+    </UserControl.Resources>
+    <StackPanel>
+        <GroupBox Header="Alerts">
+            <ui:TextBox PlaceholderText="Paste your webhook URL" />
+        </GroupBox>
+        <Button>
+            <Button.Content>Save &amp; close</Button.Content>
+        </Button>
+        <TextBlock Text="camelCaseIdentifier" />
+    </StackPanel>
+</UserControl>
