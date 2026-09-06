@@ -1,0 +1,22 @@
+<Window x:Class="FixtureApp.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Fixture — main window"
+        Width="800" Height="600">
+    <!-- This comment mentions Fake copy that must never be inventoried. -->
+    <Grid x:Name="RootGrid" Margin="12">
+        <StackPanel>
+            <TextBlock Text="Add an account to get started"
+                       Style="{DynamicResource BodyTextStyle}" />
+            <TextBlock>Accounts you saved show up here.</TextBlock>
+            <TextBlock Text="{Binding StatusBanner}" />
+            <Button Content="Launch As"
+                    ToolTip="Starts this account in its own client"
+                    AutomationProperties.Name="Launch the selected account"
+                    Command="{Binding LaunchCommand}" />
+            <Button Content="{Binding DynamicLabel}" />
+            <TextBlock Text="{}{escaped} braces are literal here" />
+            <Run Text="42" />
+        </StackPanel>
+    </Grid>
+</Window>

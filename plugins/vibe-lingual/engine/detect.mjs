@@ -333,6 +333,58 @@ function detectExistingI18n(root, framework) {
 }
 
 // ---------------------------------------------------------------------------
+// WPF stack detection (2026-09-05, additive — the JS path is byte-identical).
+// A WPF app has no package.json signals at all, so this probe runs only when the
+// JS probes found nothing (framework 'none', routerType 'unknown'). Markers:
+// a .csproj carrying <UseWPF>true</UseWPF> or a `-windows` TargetFramework, plus
+// the .xaml surface itself. existingI18n maps resx presence to lib 'resx' —
+// languageList/localePref stay null (no WPF analog to detect lexically).
+// ---------------------------------------------------------------------------
+
+const WPF_SKIP_DIRS = new Set(['node_modules', '.git', 'bin', 'obj', 'dist', 'build', 'packages', '.vs', 'out']);
+const WPF_CSPROJ_MARKER_RE = /<UseWPF>\s*true\s*<\/UseWPF>|<TargetFrameworks?>[^<]*-windows/i;
+
+function walkByExtension(dir, root, extRe, acc) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (WPF_SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
+      walkByExtension(full, root, extRe, acc);
+    } else if (entry.isFile() && extRe.test(entry.name)) {
+      acc.push(toPosix(relative(root, full)));
+    }
+  }
+}
+
+function detectWpf(root) {
+  const csprojAll = [];
+  walkByExtension(root, root, /\.csproj$/i, csprojAll);
+  const csprojFiles = csprojAll
+    .filter((rel) => {
+      const text = readText(join(root, ...rel.split('/')));
+      return text != null && WPF_CSPROJ_MARKER_RE.test(text);
+    })
+    .sort();
+  if (csprojFiles.length === 0) return null;
+
+  const xamlFiles = [];
+  walkByExtension(root, root, /\.xaml$/i, xamlFiles);
+  const xamlFileCount = xamlFiles.filter((f) => !/\.g\.xaml$/i.test(f)).length;
+
+  const resxAll = [];
+  walkByExtension(root, root, /\.resx$/i, resxAll);
+  const resxFiles = resxAll.sort();
+
+  return { csprojFiles, xamlFileCount, resxFiles };
+}
+
+// ---------------------------------------------------------------------------
 // top-level detect — assemble the inventory "app" + "existingI18n" object.
 // ---------------------------------------------------------------------------
 
@@ -346,16 +398,34 @@ export function detect(root) {
   const ssrFiles = detectSsrFiles(root, appDir);
   const existingI18n = detectExistingI18n(root, framework);
 
-  return {
-    app: {
-      root,
-      framework,
-      routerType,
-      turbopack,
-      ssrFiles,
-    },
-    existingI18n,
+  const app = {
+    root,
+    framework,
+    routerType,
+    turbopack,
+    ssrFiles,
+    stack: 'js',
   };
+
+  // The WPF probe runs only when the JS probes came up empty — a repo with any
+  // JS-app signal keeps stack 'js' even if it happens to carry a stray .xaml.
+  if (framework === 'none' && routerType === 'unknown') {
+    const wpf = detectWpf(root);
+    if (wpf) {
+      app.stack = 'wpf';
+      app.wpf = wpf;
+      return {
+        app,
+        existingI18n: {
+          lib: wpf.resxFiles.length > 0 ? 'resx' : null,
+          languageList: null,
+          localePref: null,
+        },
+      };
+    }
+  }
+
+  return { app, existingI18n };
 }
 
 export default detect;

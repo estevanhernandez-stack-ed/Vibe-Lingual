@@ -17,13 +17,18 @@
 
 const KIND_LABEL = {
   'jsx-text': 'JSX text',
+  'xaml-text': 'XAML text',
   placeholder: 'placeholder',
-  'aria-label': 'aria-label',
-  title: 'title',
+  'aria-label': 'aria-label / automation name',
+  title: 'title / tooltip',
   alt: 'alt',
   toast: 'toast / error',
   'date-intl': 'locale-sensitive date',
 };
+
+function isWpf(inv) {
+  return !!(inv.app && inv.app.stack === 'wpf');
+}
 
 function isoDate(d = new Date()) {
   return d.toISOString().slice(0, 10);
@@ -39,6 +44,27 @@ function excludedSites(inv) {
 
 function block1(inv) {
   const a = inv.app;
+  if (isWpf(inv)) {
+    const w = a.wpf || { csprojFiles: [], xamlFileCount: 0, resxFiles: [] };
+    const lines = ['## 1. Framework & i18n detection', ''];
+    lines.push('- **App stack:** WPF (.NET desktop)');
+    lines.push(`- **WPF project(s):** ${w.csprojFiles.length}`);
+    for (const f of w.csprojFiles.slice(0, 6)) lines.push(`  - \`${f}\``);
+    lines.push(`- **XAML surface:** ${w.xamlFileCount} file(s) (generated \`*.g.xaml\` excluded)`);
+    lines.push(
+      `- **Existing localization:** ${
+        inv.existingI18n.lib === 'resx'
+          ? `resx resources present (${w.resxFiles.length} file(s)) — the natural extraction target`
+          : 'none — no .resx resources; the UI chrome is unlocalized'
+      }`,
+    );
+    lines.push('');
+    lines.push(
+      '> The mutating loop (extract → wire → translate → guard) is **not yet implemented** for WPF — this scan is the read-only inventory. The `wpf-resx` adapter is a declared stub; `localize`/`wire` will stand down honestly.',
+    );
+    lines.push('');
+    return lines.join('\n');
+  }
   const lines = ['## 1. Framework & i18n detection', ''];
   lines.push(`- **Router type:** ${a.routerType}`);
   lines.push(`- **i18n framework:** ${a.framework}${a.framework === 'none' ? ' (no i18n library installed yet)' : ''}`);
@@ -98,6 +124,10 @@ function block3(inv) {
   lines.push('| Kind | Count |');
   lines.push('|---|---|');
   for (const k of Object.keys(inv.countsByKind)) {
+    // On a WPF inventory the JS-only kinds sit at zero by construction — showing
+    // seven zero rows reads as a broken scan, so they are elided there. The JS
+    // path renders every kind, zeros included, exactly as before.
+    if (isWpf(inv) && inv.countsByKind[k] === 0) continue;
     lines.push(`| ${KIND_LABEL[k] || k} | ${inv.countsByKind[k]} |`);
   }
   const total = Object.values(inv.countsByKind).reduce((a, b) => a + b, 0);
@@ -113,9 +143,15 @@ function block3(inv) {
     }
     lines.push('');
   }
-  lines.push(
-    '> Scanner owns attribute-literal detection (placeholder / aria-label / title / alt); ESLint `jsx-no-literals` is too noisy on attributes and is reserved for JSX **text** only.',
-  );
+  if (isWpf(inv)) {
+    lines.push(
+      '> Scanner owns display-attribute detection via a WHITELIST of display properties (Text/Content/Header/ToolTip/PlaceholderText/AutomationProperties.\\*, Setter values included). Markup-extension values (`{Binding …}`, `{DynamicResource …}`) are machinery and are never inventoried; the `{}` escape prefix marks a literal.',
+    );
+  } else {
+    lines.push(
+      '> Scanner owns attribute-literal detection (placeholder / aria-label / title / alt); ESLint `jsx-no-literals` is too noisy on attributes and is reserved for JSX **text** only.',
+    );
+  }
   lines.push('');
   return lines.join('\n');
 }
@@ -146,6 +182,17 @@ function block4(inv) {
 
 function block5(inv) {
   const included = includedSites(inv);
+  if (isWpf(inv)) {
+    const lines = ['## 5. Gap + phased plan', ''];
+    lines.push('Arc: **extract → wire culture → translate → guard** — pending the `wpf-resx` adapter (not yet implemented; this brief is the read side).');
+    lines.push('');
+    lines.push(`- **Extract:** ${included.length} string site(s) across ${inv.componentsByDensity.length} XAML file(s) → \`.resx\` resources referenced from XAML, one fully-extracted file at a time.`);
+    lines.push('- **Wire culture:** per-locale satellite \`.resx\` files + a `CultureInfo` selection point; the package manifest declares a language ONLY when the UI genuinely ships it.');
+    lines.push('- **Translate:** generate the per-culture resx catalogs.');
+    lines.push('- **Guard:** a resx key-parity test across cultures (missing AND extra keys), plus a source-level fence banning new hardcoded display literals per extracted file.');
+    lines.push('');
+    return lines.join('\n');
+  }
   const lines = ['## 5. Gap + phased plan', ''];
   lines.push('Arc: **extract → wire framework → translate → wire-to-locale → guard.**');
   lines.push('');
@@ -160,6 +207,16 @@ function block5(inv) {
 
 function block6(inv) {
   const a = inv.app;
+  if (isWpf(inv)) {
+    const lines = ['## 6. Stack-specific gotchas', ''];
+    lines.push('- **Declared languages must not outrun the UI.** A package manifest `<Resource Language>` entry is a Store-facing claim; adding one before the UI genuinely ships that language is a lie. Listing-language translation needs no code and no manifest change.');
+    lines.push('- **Code-composed strings cannot be extracted from XAML.** Strings built in C# (result messages, status lines) need a key+data boundary so the view layer owns the sentence — audit where prose is composed before sweeping the markup.');
+    lines.push('- **Bindings and markup extensions carry no copy** — but a `StringFormat` inside one can (`{Binding Count, StringFormat=…}`). This scanner excludes ALL markup-extension values; StringFormat copy inside bindings is a known blind spot to sweep by hand.');
+    lines.push('- **Font glyph coverage:** display fonts often cover less of Unicode than body fonts. Verify glyph coverage per target language (Cyrillic, Vietnamese diacritics, CJK) before shipping a culture.');
+    lines.push('- **RTL surface:** XAML layouts assume LTR (`FlowDirection`). Flag before adding Arabic / Hebrew / Urdu.');
+    lines.push('');
+    return lines.join('\n');
+  }
   const lines = ['## 6. Stack-specific gotchas', ''];
   lines.push('- **firebase-admin banned in Turbopack SSR** — safe only in `functions/`. Screen App Router `page.tsx`/`layout.tsx` for firebase-admin imports before mounting a locale loader there.');
   lines.push('- **Timezone decision (surfaced, not auto-resolved):** do NOT set a global fixed `timeZone`. Client-rendered local dates want the browser zone (a fixed tz shifts dates a day for distant users); SSR-rendered dates DO need an explicit tz. Tests pin `timeZone="UTC"` for determinism only.');

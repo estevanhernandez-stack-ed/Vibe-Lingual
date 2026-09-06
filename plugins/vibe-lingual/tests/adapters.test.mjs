@@ -127,16 +127,17 @@ describe('registry — robustness (no crash, degrades cleanly)', () => {
 });
 
 describe('registry — roster + precedence', () => {
-  test('exactly four adapters registered, next-intl first', () => {
+  test('exactly five adapters registered, next-intl first (wpf-resx leads the stubs — its stack signal is definitive)', () => {
     expect(REGISTERED_ADAPTERS.map((a) => a.id)).toEqual([
       'next-intl',
+      'wpf-resx',
       'pages-router',
       'react-i18next',
       'vue-i18n',
     ]);
   });
 
-  test('only next-intl is marked implemented; the three stubs are not', () => {
+  test('only next-intl is marked implemented; the four stubs are not', () => {
     const implemented = REGISTERED_ADAPTERS.filter((a) => a.implemented).map((a) => a.id);
     expect(implemented).toEqual(['next-intl']);
   });

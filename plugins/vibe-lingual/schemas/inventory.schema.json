@@ -20,7 +20,18 @@
         },
         "routerType": { "type": "string", "enum": ["app", "pages", "unknown"] },
         "turbopack": { "type": "boolean" },
-        "ssrFiles": { "type": "array", "items": { "type": "string" } }
+        "ssrFiles": { "type": "array", "items": { "type": "string" } },
+        "stack": { "type": "string", "enum": ["js", "wpf"] },
+        "wpf": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["csprojFiles", "xamlFileCount", "resxFiles"],
+          "properties": {
+            "csprojFiles": { "type": "array", "items": { "type": "string" } },
+            "xamlFileCount": { "type": "integer", "minimum": 0 },
+            "resxFiles": { "type": "array", "items": { "type": "string" } }
+          }
+        }
       }
     },
     "existingI18n": {
@@ -69,7 +80,7 @@
           "line": { "type": "integer", "minimum": 0 },
           "kind": {
             "type": "string",
-            "enum": ["jsx-text", "placeholder", "aria-label", "title", "alt", "toast", "date-intl"]
+            "enum": ["jsx-text", "xaml-text", "placeholder", "aria-label", "title", "alt", "toast", "date-intl"]
           },
           "text": { "type": "string" },
           "suggestedNamespace": { "type": "string" },
@@ -87,6 +98,7 @@
       "required": ["jsx-text", "placeholder", "aria-label", "title", "alt", "toast", "date-intl"],
       "properties": {
         "jsx-text": { "type": "integer", "minimum": 0 },
+        "xaml-text": { "type": "integer", "minimum": 0 },
         "placeholder": { "type": "integer", "minimum": 0 },
         "aria-label": { "type": "integer", "minimum": 0 },
         "title": { "type": "integer", "minimum": 0 },
