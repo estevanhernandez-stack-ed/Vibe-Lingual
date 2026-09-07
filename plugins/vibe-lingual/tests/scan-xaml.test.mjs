@@ -48,6 +48,7 @@ describe('scan — XAML (WPF stack)', () => {
     expect(allTexts).not.toContain('camelCaseIdentifier'); // identifier-shaped
     expect(allTexts).not.toContain('RootGrid'); // x:Name is not a display attr
     expect(allTexts).not.toContain('#FF0000'); // Setter for a non-display property
+    expect(allTexts).not.toContain('Space Grotesk'); // FontFamily value element — a font stack, not copy
     expect(allTexts).not.toContain('Generated copy'); // *.g.xaml under obj/
   });
 

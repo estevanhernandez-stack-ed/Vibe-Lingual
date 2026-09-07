@@ -127,7 +127,7 @@ describe('registry — robustness (no crash, degrades cleanly)', () => {
 });
 
 describe('registry — roster + precedence', () => {
-  test('exactly five adapters registered, next-intl first (wpf-resx leads the stubs — its stack signal is definitive)', () => {
+  test('exactly five adapters registered, the two implemented first', () => {
     expect(REGISTERED_ADAPTERS.map((a) => a.id)).toEqual([
       'next-intl',
       'wpf-resx',
@@ -137,9 +137,9 @@ describe('registry — roster + precedence', () => {
     ]);
   });
 
-  test('only next-intl is marked implemented; the four stubs are not', () => {
+  test('next-intl and wpf-resx are implemented; the three stubs are not', () => {
     const implemented = REGISTERED_ADAPTERS.filter((a) => a.implemented).map((a) => a.id);
-    expect(implemented).toEqual(['next-intl']);
+    expect(implemented).toEqual(['next-intl', 'wpf-resx']);
   });
 });
 

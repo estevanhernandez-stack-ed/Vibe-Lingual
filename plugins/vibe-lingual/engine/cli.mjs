@@ -14,6 +14,7 @@ import { auditReport } from './audit-report.mjs';
 import { extract, promoteStaged } from './extract.mjs';
 import { rollback as rollbackBatch } from './backup.mjs';
 import { resolveAdapter } from './adapters/index.mjs';
+import { wpfResxAdapter } from './adapters/wpf-resx/index.mjs';
 import { verifyParity } from './parity.mjs';
 
 const SUBCOMMANDS = ['scan', 'audit', 'extract', 'wire', 'parity', 'detect'];
@@ -160,7 +161,8 @@ function runAudit(argv) {
   // stands down until the wpf-resx adapter lands.
   if (inventory.app && inventory.app.stack === 'wpf') {
     console.error(
-      'vibe-lingual audit: the WPF stack is scan-only in this version — the audit rules are Next/JS-specific and the wpf-resx adapter is not yet implemented. The scan brief carries the WPF readiness picture.',
+      'vibe-lingual audit: the audit rules are Next/JS-specific and do not apply to a WPF inventory. ' +
+        'The scan brief carries the WPF readiness picture; `extract` (with --clr-namespace) runs the wpf-resx loop directly.',
     );
     return 1;
   }
@@ -308,14 +310,47 @@ function runExtract(argv) {
   const inventory = loadInventoryOrDie('extract', args.inventory);
   if (inventory == null) return 2;
 
-  // The codemod is a jscodeshift transform over JS/TS — pointing it at a WPF
-  // inventory would route XAML files into a JavaScript parser. Stand down until
-  // the wpf-resx adapter brings its own transform.
+  // Stack dispatch (2026-09-06): a WPF inventory routes to the wpf-resx
+  // adapter's own extract loop (XAML codemod + idempotent resx merge + backup
+  // batch) instead of the JS/TS jscodeshift path. Flags:
+  //   --clr-namespace <ns>   REQUIRED — designer-class namespace for xmlns:loc
+  //   --project-dir <rel>    app project dir under the root (default '')
+  //   --resx-dir <rel>       default 'Properties'
+  //   --locales a,b,c        seed per-culture catalogs with the key set
+  //   --dry-run              plan + report, write nothing
   if (inventory.app && inventory.app.stack === 'wpf') {
+    if (typeof args['clr-namespace'] !== 'string' || !args['clr-namespace']) {
+      console.error(
+        'vibe-lingual extract (wpf): --clr-namespace is required (e.g. --clr-namespace My.App.Properties).',
+      );
+      return 2;
+    }
+    const appRoot = (inventory.app && inventory.app.root) || root;
+    let res;
+    try {
+      res = wpfResxAdapter.extractXaml(appRoot, inventory, {
+        clrNamespace: args['clr-namespace'],
+        projectDir: typeof args['project-dir'] === 'string' ? args['project-dir'] : '',
+        resxDir: typeof args['resx-dir'] === 'string' ? args['resx-dir'] : 'Properties',
+        locales:
+          typeof args.locales === 'string'
+            ? args.locales.split(',').map((s) => s.trim()).filter(Boolean)
+            : [],
+        dryRun: !!args['dry-run'],
+      });
+    } catch (e) {
+      console.error(`vibe-lingual extract (wpf): ${e.message}`);
+      return 2;
+    }
     console.error(
-      'vibe-lingual extract: the WPF stack is scan-only in this version — the codemod is JS/TS-only and the wpf-resx adapter is not yet implemented. Nothing was written.',
+      `vibe-lingual extract (wpf${res.dryRun ? ', dry-run' : ''}): ${res.filesChanged} file(s) rewritten, ` +
+        `${res.entriesAdded} entrie(s) added (${res.totalEntries} total) → ${res.resxPath}, ` +
+        `${res.staged.length} site(s) staged for hand conversion` +
+        (res.batchId ? `, backup batch ${res.batchId}` : '') +
+        (res.localeFiles.length ? `, culture catalogs: ${res.localeFiles.join(', ')}` : ''),
     );
-    return 1;
+    console.log(JSON.stringify(res, null, 2));
+    return 0;
   }
 
   let auditObj = null;
