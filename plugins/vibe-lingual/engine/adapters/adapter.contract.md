@@ -131,6 +131,27 @@ resolveAdapter(detection) ->
   malformed detection degrades to `{ adapter: null, status: 'not-yet-implemented',
   framework: 'unknown' }`.
 
+## Payload types follow the framework (2026-09-06 addendum)
+
+The second implemented adapter (`wpf-resx`) proved a latent assumption in the
+interface: `transform: jscodeshiftTransform` and `emitGuard(): EslintOverride`
+are JS-ecosystem payload types, not seam requirements. The seam's real promise
+is per-framework mutating machinery behind uniform method NAMES with honest
+routing around them. So, refined:
+
+- `transform` is the framework's codemod in whatever shape its language needs —
+  jscodeshift for JS/TS, a `(text, path, options) → { newText, entries, staged,
+  changed }` function for XAML. Callers dispatch by `adapter.id`/stack, never by
+  assuming the payload type.
+- `emitGuard` returns whatever artifact enforces the ratchet natively — an
+  ESLint override for JS, an emitted source-reading fence TEST file for WPF
+  (`{ path, contents }`).
+- `emitParityTest` emits into the target's own test culture (a jest file for JS
+  catalogs, an xUnit file for resx).
+- An adapter may expose additional driver methods (wpf-resx: `extractXaml`) that
+  the CLI dispatches to on its stack; the four contract methods remain the
+  uniform surface.
+
 ## Adding an adapter (the future path)
 
 1. Implement the interface under `adapters/<id>/` (mirror `adapters/next-intl/`).

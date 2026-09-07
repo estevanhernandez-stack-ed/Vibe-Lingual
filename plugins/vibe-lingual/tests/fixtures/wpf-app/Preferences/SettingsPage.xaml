@@ -3,6 +3,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:ui="http://schemas.example/winfx/ui">
     <UserControl.Resources>
+        <FontFamily x:Key="DisplayFont">Space Grotesk, Segoe UI Variable Display, Segoe UI</FontFamily>
         <Style x:Key="RetryButton" TargetType="Button">
             <Setter Property="Content" Value="Retry" />
             <Setter Property="Background" Value="#FF0000" />

@@ -11,21 +11,21 @@
 // crash, never a mutation. See adapter.contract.md for the full interface.
 
 import { nextIntlAdapter } from './next-intl/index.mjs';
+import { wpfResxAdapter } from './wpf-resx/index.mjs';
 import { reactI18nextStub } from './_stubs/react-i18next.mjs';
 import { pagesRouterStub } from './_stubs/pages-router.mjs';
 import { vueI18nStub } from './_stubs/vue-i18n.mjs';
-import { wpfResxStub } from './_stubs/wpf-resx.mjs';
 
 // Registration order IS precedence. The implemented adapter is checked first so it
 // wins on any app it claims; the stubs follow only to label the framework for the
 // not-yet-implemented report. The pages-router stub precedes react-i18next so a
 // Pages-Router app is named by its router (the disqualifier) rather than by an
 // installed react-i18next dep.
-const IMPLEMENTED_ADAPTERS = [nextIntlAdapter];
-// wpf-resx leads the stubs: the stack signal (app.stack === 'wpf') is definitive
-// where the JS stubs infer from dependencies, so a WPF app is always named by
-// its stack rather than by any stray JS dep it happens to carry.
-const STUB_ADAPTERS = [wpfResxStub, pagesRouterStub, reactI18nextStub, vueI18nStub];
+// wpf-resx graduated from the stubs on 2026-09-06 (the mutating half landed);
+// its stack signal (app.stack === 'wpf') is definitive and cannot collide with
+// next-intl's routerType claim, so implemented order between them is moot.
+const IMPLEMENTED_ADAPTERS = [nextIntlAdapter, wpfResxAdapter];
+const STUB_ADAPTERS = [pagesRouterStub, reactI18nextStub, vueI18nStub];
 
 // The full ordered roster (implemented first). Exposed for introspection/tests.
 export const REGISTERED_ADAPTERS = [...IMPLEMENTED_ADAPTERS, ...STUB_ADAPTERS];

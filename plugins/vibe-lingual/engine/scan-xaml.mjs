@@ -24,6 +24,13 @@
 //   - everything the shared text gates reject (no letters, identifier/CSS-token
 //     shapes, the short-fragment floor for xaml-text).
 //
+// 2026-09-06 (wpf-resx adapter): the tokenizer now records SPANS. The detailed
+// layer (`scanXamlFileDetailed`) returns each site with the exact byte range of
+// its attribute value or text node — the wpf-resx transform rewrites through
+// those spans, so the scanner and the codemod can never disagree about what a
+// site is. `scanXaml` derives the schema-clean inventory from the same pass; the
+// persisted shape is unchanged.
+//
 // No mutation, no network. A file that fails to read is skipped; the tokenizer
 // itself is forgiving (unclosed constructs consume to end-of-file, never throw).
 
@@ -101,6 +108,22 @@ function kindForProperty(propName) {
   return Object.prototype.hasOwnProperty.call(ATTR_KIND, last) ? ATTR_KIND[last] : null;
 }
 
+// Value-typed elements whose text content is a parsed VALUE, never copy — a
+// <FontFamily> holds a font stack, a <Color> a hex triplet, a <Thickness> a
+// margin. Letters and commas get them past the generic gates (the RoRoRo
+// dogfood staged two brand font stacks), so they are excluded by name.
+const VALUE_ELEMENTS = new Set([
+  'FontFamily',
+  'Color',
+  'SolidColorBrush',
+  'Thickness',
+  'CornerRadius',
+  'GridLength',
+  'Duration',
+  'Geometry',
+  'PathGeometry',
+]);
+
 // A markup-extension value ({Binding …} etc.) carries no copy. The `{}` prefix
 // is XAML's escape for a literal string starting with '{': strip it, keep the rest.
 function literalAttrValue(raw) {
@@ -126,26 +149,34 @@ function decodeEntities(s) {
 }
 
 // ---------------------------------------------------------------------------
-// the tokenizer — one forward pass, tracking line numbers and an element stack.
+// the tokenizer — one forward pass, tracking line numbers, spans, and an
+// element stack. Produces DETAILED sites; scanXaml strips them to the
+// schema-clean inventory shape.
 // ---------------------------------------------------------------------------
 
 const ATTR_RE = /([A-Za-z_][\w.:-]*)\s*=\s*("([^"]*)"|'([^']*)')/g;
 
-function scanXamlFile(relPosix, text, sites) {
+export function scanXamlFileDetailed(relPosix, text) {
   const namespace = basename(relPosix).replace(/\.xaml$/i, '');
+  const sites = [];
   const stack = []; // open element names (local name, xmlns prefix stripped)
   let i = 0;
   let line = 1;
   const n = text.length;
 
+  // Tracks the most recently OPENED element so a text node can know whether it
+  // is the element's sole content (open tag → text → matching close, nothing
+  // between). Any other construct in between clears it.
+  let lastOpen = null; // { name, gtIndex, contentStart, attrNames, pendingSite }
+
   const advance = (to) => {
     for (; i < to; i += 1) if (text.charCodeAt(i) === 10) line += 1;
   };
 
-  const pushSite = (kind, raw, atLine) => {
+  const makeSite = (kind, raw, atLine, extra) => {
     const value = decodeEntities(raw).trim();
-    if (!isUserFacingText(value, kind)) return;
-    sites.push({
+    if (!isUserFacingText(value, kind)) return null;
+    const site = {
       file: relPosix,
       line: atLine,
       kind,
@@ -154,7 +185,10 @@ function scanXamlFile(relPosix, text, sites) {
       suggestedKey: suggestedKey(value),
       confidence: siteConfidence(kind, value),
       structuralIntl: false,
-    });
+      ...extra,
+    };
+    sites.push(site);
+    return site;
   };
 
   while (i < n) {
@@ -167,12 +201,32 @@ function scanXamlFile(relPosix, text, sites) {
     if (lt > i) {
       const raw = text.slice(i, lt);
       const textLine = line;
+      const textStart = i;
       if (raw.trim()) {
         // property-element syntax: text directly inside <X.Property> takes that
-        // property's kind; otherwise any element text is xaml-text.
+        // property's kind; otherwise any element text is xaml-text — unless the
+        // enclosing element is a value type (font stacks, colors: not copy).
         const enclosing = stack.length ? stack[stack.length - 1] : null;
+        if (enclosing && VALUE_ELEMENTS.has(enclosing)) {
+          advance(lt);
+          continue;
+        }
         const propKind = enclosing && enclosing.includes('.') ? kindForProperty(enclosing) : null;
-        pushSite(propKind || 'xaml-text', raw, textLine);
+        const site = makeSite(propKind || 'xaml-text', raw, textLine, {
+          siteType: 'text',
+          span: { start: textStart, end: lt },
+          enclosingElement: enclosing,
+        });
+        // Sole-content candidacy: the text starts exactly where the last opened
+        // element's content starts. Confirmed when the very next construct is
+        // that element's close tag.
+        if (site && lastOpen && lastOpen.contentStart === textStart) {
+          lastOpen.pendingSite = site;
+        }
+      } else if (lastOpen && lastOpen.contentStart === textStart) {
+        // whitespace-only content keeps the candidacy window open for nothing —
+        // there is no site to enrich; clear it.
+        lastOpen = null;
       }
       advance(lt);
     }
@@ -180,16 +234,19 @@ function scanXamlFile(relPosix, text, sites) {
     // ----- comment / CDATA / processing instruction / doctype -----
     if (text.startsWith('<!--', i)) {
       const end = text.indexOf('-->', i + 4);
+      lastOpen = null;
       advance(end === -1 ? n : end + 3);
       continue;
     }
     if (text.startsWith('<![CDATA[', i)) {
       const end = text.indexOf(']]>', i + 9);
+      lastOpen = null;
       advance(end === -1 ? n : end + 3);
       continue;
     }
     if (text.startsWith('<?', i) || text.startsWith('<!', i)) {
       const end = text.indexOf('>', i);
+      lastOpen = null;
       advance(end === -1 ? n : end + 1);
       continue;
     }
@@ -197,8 +254,20 @@ function scanXamlFile(relPosix, text, sites) {
     // ----- closing tag -----
     if (text.startsWith('</', i)) {
       const end = text.indexOf('>', i);
+      const closeEnd = end === -1 ? n : end + 1;
+      // Sole-content confirmation: this close immediately follows the candidate
+      // text node of the element it closes.
+      if (lastOpen && lastOpen.pendingSite && lastOpen.pendingSite.span.end === i) {
+        lastOpen.pendingSite.soleContent = {
+          elementName: lastOpen.name,
+          openTagGtIndex: lastOpen.gtIndex,
+          closeEndIndex: closeEnd,
+          openAttrNames: lastOpen.attrNames,
+        };
+      }
+      lastOpen = null;
       if (stack.length) stack.pop();
-      advance(end === -1 ? n : end + 1);
+      advance(closeEnd);
       continue;
     }
 
@@ -216,6 +285,7 @@ function scanXamlFile(relPosix, text, sites) {
       }
       j += 1;
     }
+    const tagStart = i;
     const tag = text.slice(i + 1, j); // without < >
     const tagLine = line;
     const selfClosing = /\/\s*$/.test(tag);
@@ -231,29 +301,76 @@ function scanXamlFile(relPosix, text, sites) {
     while ((am = ATTR_RE.exec(tag)) !== null) {
       const attrName = am[1];
       const attrValue = am[3] != null ? am[3] : am[4];
+      // Span of the raw value INSIDE its quotes, in whole-file coordinates:
+      // am.index is the attr name's offset within `tag`; the value starts after
+      // the opening quote of the quoted group.
+      const quoted = am[2];
+      const valueOffsetInMatch = am[0].length - quoted.length + 1; // past the opening quote
+      const valueStart = tagStart + 1 + am.index + valueOffsetInMatch;
       const localAttr = attrName.includes(':') && !attrName.startsWith('AutomationProperties')
         ? attrName.slice(attrName.indexOf(':') + 1)
         : attrName;
-      attrs.push({ name: localAttr, value: attrValue });
+      attrs.push({
+        name: localAttr,
+        rawName: attrName,
+        value: attrValue,
+        span: { start: valueStart, end: valueStart + attrValue.length },
+      });
       if (localName === 'Setter' && localAttr === 'Property') setterProperty = attrValue;
     }
 
-    for (const { name, value } of attrs) {
+    for (const attr of attrs) {
       let kind = null;
       if (localName === 'Setter') {
-        if (name !== 'Value') continue;
+        if (attr.name !== 'Value') continue;
         kind = kindForProperty(setterProperty);
       } else {
-        kind = Object.prototype.hasOwnProperty.call(ATTR_KIND, name) ? ATTR_KIND[name] : null;
+        kind = Object.prototype.hasOwnProperty.call(ATTR_KIND, attr.name) ? ATTR_KIND[attr.name] : null;
       }
       if (!kind) continue;
-      const literal = literalAttrValue(value);
+      const literal = literalAttrValue(attr.value);
       if (literal == null) continue; // {Binding …} and friends — machinery
-      pushSite(kind, literal, tagLine);
+      makeSite(kind, literal, tagLine, {
+        siteType: 'attr',
+        attrName: attr.rawName,
+        elementName: localName,
+        span: attr.span, // raw value incl. any '{}' escape prefix
+        escaped: attr.value.startsWith('{}'),
+      });
     }
 
-    if (!selfClosing && localName) stack.push(localName);
+    if (!selfClosing && localName) {
+      stack.push(localName);
+      lastOpen = {
+        name: localName,
+        gtIndex: j === n ? n - 1 : j,
+        contentStart: j === n ? n : j + 1,
+        attrNames: attrs.map((a) => a.name),
+        pendingSite: null,
+      };
+    } else {
+      lastOpen = null;
+    }
     advance(j === n ? n : j + 1);
+  }
+
+  return sites;
+}
+
+// The schema-clean shape scanXaml persists: detailed span/structure fields
+// stripped (the inventory schema is additionalProperties:false by design).
+function scanXamlFile(relPosix, text, sites) {
+  for (const s of scanXamlFileDetailed(relPosix, text)) {
+    sites.push({
+      file: s.file,
+      line: s.line,
+      kind: s.kind,
+      text: s.text,
+      suggestedNamespace: s.suggestedNamespace,
+      suggestedKey: s.suggestedKey,
+      confidence: s.confidence,
+      structuralIntl: false,
+    });
   }
 }
 
