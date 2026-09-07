@@ -87,6 +87,11 @@ const ATTR_KIND = {
   Text: 'xaml-text',
   Content: 'xaml-text',
   Header: 'xaml-text',
+  // `Heading` is the display property of the near-universal first-party "page header"
+  // control pattern (RoRoRo's PageHeader Heading="History"); it reads like Header and
+  // holds the same kind of copy. Added 2026-09-06 from the RoRoRo extraction dogfood,
+  // where 9 page headings sat just outside the whitelist.
+  Heading: 'xaml-text',
   Title: 'xaml-text',
   Caption: 'xaml-text',
   Description: 'xaml-text',

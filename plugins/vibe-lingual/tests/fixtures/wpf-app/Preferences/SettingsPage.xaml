@@ -11,6 +11,7 @@
         </Style>
     </UserControl.Resources>
     <StackPanel>
+        <controls:PageHeader Heading="Settings" xmlns:controls="clr-namespace:FixtureApp.Controls" />
         <GroupBox Header="Alerts">
             <ui:TextBox PlaceholderText="Paste your webhook URL" />
         </GroupBox>

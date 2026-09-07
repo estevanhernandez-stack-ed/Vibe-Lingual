@@ -30,6 +30,7 @@ describe('scan — XAML (WPF stack)', () => {
         'Launch As',
         '{escaped} braces are literal here',
         'Retry',
+        'Settings', // PageHeader Heading — the display-property whitelist addition
         'Alerts',
         'Save & close',
       ].sort(),
@@ -64,13 +65,13 @@ describe('scan — XAML (WPF stack)', () => {
     const inv = scanFixture();
     expect(inv.schemaVersion).toBe(1);
     expect(inv.app.stack).toBe('wpf');
-    expect(inv.countsByKind['xaml-text']).toBe(8);
+    expect(inv.countsByKind['xaml-text']).toBe(9);
     expect(inv.countsByKind.title).toBe(1);
     expect(inv.countsByKind['aria-label']).toBe(1);
     expect(inv.countsByKind.placeholder).toBe(1);
     expect(inv.countsByKind['jsx-text']).toBe(0);
     expect(inv.componentsByDensity[0]).toEqual({ file: 'Views/MainWindow.xaml', count: 7 });
-    expect(inv.componentsByDensity[1]).toEqual({ file: 'Preferences/SettingsPage.xaml', count: 4 });
+    expect(inv.componentsByDensity[1]).toEqual({ file: 'Preferences/SettingsPage.xaml', count: 5 });
     for (const s of inv.sites) {
       expect(typeof s.line).toBe('number');
       expect(s.line).toBeGreaterThan(0);
