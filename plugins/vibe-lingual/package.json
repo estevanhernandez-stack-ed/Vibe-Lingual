@@ -1,6 +1,6 @@
 {
   "name": "@626labs/vibe-lingual-engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deterministic Node engine for the vibe-lingual Claude Code plugin — detection, string scan, audit, six-block brief, parity emit/verify, and the next-intl codemod adapter.",
   "type": "module",
   "private": true,
